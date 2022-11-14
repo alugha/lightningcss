@@ -650,6 +650,11 @@ impl<'i, Impl: SelectorImpl<'i>> Selector<'i, Impl> {
   }
 
   #[inline]
+  pub fn push(&mut self, component: Component<'i, Impl>) {
+    self.1.push(component);
+  }
+
+  #[inline]
   pub fn parts(&self) -> Option<&[Impl::Identifier]> {
     if !self.is_part() {
       return None;
