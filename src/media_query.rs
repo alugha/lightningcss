@@ -6,15 +6,18 @@ use crate::macros::enum_property;
 use crate::printer::Printer;
 use crate::rules::custom_media::CustomMediaRule;
 use crate::rules::Location;
+use crate::targets::Browsers;
 use crate::traits::{Parse, ToCss};
+use crate::values::ident::Ident;
 use crate::values::number::CSSNumber;
 use crate::values::string::CowArcStr;
 use crate::values::{length::Length, ratio::Ratio, resolution::Resolution};
+use crate::visitor::Visit;
 use cssparser::*;
 use std::collections::{HashMap, HashSet};
 
 /// A [media query list](https://drafts.csswg.org/mediaqueries/#mq-list).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Visit)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MediaList<'i> {
   /// The list of media queries.
@@ -141,7 +144,7 @@ enum_property! {
 }
 
 /// A [media type](https://drafts.csswg.org/mediaqueries/#media-types) within a media query.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Visit)]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
@@ -173,7 +176,8 @@ impl<'i> Parse<'i> for MediaType<'i> {
 }
 
 /// A [media query](https://drafts.csswg.org/mediaqueries/#media).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Visit)]
+#[visit(visit_media_query, MEDIA_QUERIES)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MediaQuery<'i> {
   /// The qualifier for this query.
@@ -287,17 +291,8 @@ impl<'i> MediaQuery<'i> {
     if let Some(cond) = &b.condition {
       self.condition = if let Some(condition) = &self.condition {
         if condition != cond {
-          macro_rules! parenthesize {
-            ($condition: ident) => {
-              if matches!($condition, MediaCondition::Operation(_, Operator::Or)) {
-                MediaCondition::InParens(Box::new($condition.clone()))
-              } else {
-                $condition.clone()
-              }
-            };
-          }
           Some(MediaCondition::Operation(
-            vec![parenthesize!(condition), parenthesize!(cond)],
+            vec![condition.clone(), cond.clone()],
             Operator::And,
           ))
         } else {
@@ -343,11 +338,14 @@ impl<'i> ToCss for MediaQuery<'i> {
       None => return Ok(()),
     };
 
-    if self.media_type != MediaType::All || self.qualifier.is_some() {
+    let needs_parens = if self.media_type != MediaType::All || self.qualifier.is_some() {
       dest.write_str(" and ")?;
-    }
+      matches!(condition, MediaCondition::Operation(_, op) if *op != Operator::And)
+    } else {
+      false
+    };
 
-    condition.to_css(dest)
+    condition.to_css_with_parens_if_needed(dest, needs_parens)
   }
 }
 
@@ -362,7 +360,7 @@ enum_property! {
 }
 
 /// Represents a media condition.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Visit)]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
@@ -373,11 +371,11 @@ pub enum MediaCondition<'i> {
   #[cfg_attr(feature = "serde", serde(borrow))]
   Feature(MediaFeature<'i>),
   /// A negation of a condition.
+  #[skip_type]
   Not(Box<MediaCondition<'i>>),
   /// A set of joint operations.
+  #[skip_type]
   Operation(Vec<MediaCondition<'i>>, Operator),
-  /// A condition wrapped in parenthesis.
-  InParens(Box<MediaCondition<'i>>),
 }
 
 impl<'i> MediaCondition<'i> {
@@ -433,12 +431,39 @@ impl<'i> MediaCondition<'i> {
   fn parse_paren_block<'t>(input: &mut Parser<'i, 't>) -> Result<Self, ParseError<'i, ParserError<'i>>> {
     input.parse_nested_block(|input| {
       if let Ok(inner) = input.try_parse(|i| Self::parse(i, true)) {
-        return Ok(MediaCondition::InParens(Box::new(inner)));
+        return Ok(inner);
       }
 
       let feature = MediaFeature::parse(input)?;
       Ok(MediaCondition::Feature(feature))
     })
+  }
+
+  fn needs_parens(&self, parent_operator: Option<Operator>, targets: &Option<Browsers>) -> bool {
+    match self {
+      MediaCondition::Not(_) => true,
+      MediaCondition::Operation(_, op) => Some(*op) != parent_operator,
+      MediaCondition::Feature(f) => {
+        parent_operator != Some(Operator::And)
+          && targets.is_some()
+          && matches!(f, MediaFeature::Interval { .. })
+          && !Feature::MediaIntervalSyntax.is_compatible(targets.unwrap())
+      }
+    }
+  }
+
+  fn to_css_with_parens_if_needed<W>(&self, dest: &mut Printer<W>, needs_parens: bool) -> Result<(), PrinterError>
+  where
+    W: std::fmt::Write,
+  {
+    if needs_parens {
+      dest.write_char('(')?;
+    }
+    self.to_css(dest)?;
+    if needs_parens {
+      dest.write_char(')')?;
+    }
+    Ok(())
   }
 }
 
@@ -451,21 +476,17 @@ impl<'i> ToCss for MediaCondition<'i> {
       MediaCondition::Feature(ref f) => f.to_css(dest),
       MediaCondition::Not(ref c) => {
         dest.write_str("not ")?;
-        c.to_css(dest)
-      }
-      MediaCondition::InParens(ref c) => {
-        dest.write_char('(')?;
-        c.to_css(dest)?;
-        dest.write_char(')')
+        c.to_css_with_parens_if_needed(dest, c.needs_parens(None, &dest.targets))
       }
       MediaCondition::Operation(ref list, op) => {
         let mut iter = list.iter();
-        iter.next().unwrap().to_css(dest)?;
+        let first = iter.next().unwrap();
+        first.to_css_with_parens_if_needed(dest, first.needs_parens(Some(op), &dest.targets))?;
         for item in iter {
           dest.write_char(' ')?;
           op.to_css(dest)?;
           dest.write_char(' ')?;
-          item.to_css(dest)?;
+          item.to_css_with_parens_if_needed(dest, item.needs_parens(Some(op), &dest.targets))?;
         }
         Ok(())
       }
@@ -474,7 +495,7 @@ impl<'i> ToCss for MediaCondition<'i> {
 }
 
 /// A [comparator](https://drafts.csswg.org/mediaqueries/#typedef-mf-comparison) within a media query.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Visit)]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
@@ -530,7 +551,7 @@ impl MediaFeatureComparison {
 }
 
 /// A [media feature](https://drafts.csswg.org/mediaqueries/#typedef-media-feature)
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Visit)]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
@@ -541,16 +562,16 @@ pub enum MediaFeature<'i> {
   Plain {
     /// The name of the feature.
     #[cfg_attr(feature = "serde", serde(borrow))]
-    name: CowArcStr<'i>,
+    name: Ident<'i>,
     /// The feature value.
     value: MediaFeatureValue<'i>,
   },
   /// A boolean feature, e.g. `(hover)`.
-  Boolean(CowArcStr<'i>),
+  Boolean(Ident<'i>),
   /// A range, e.g. `(width > 240px)`.
   Range {
     /// The name of the feature.
-    name: CowArcStr<'i>,
+    name: Ident<'i>,
     /// A comparator.
     operator: MediaFeatureComparison,
     /// The feature value.
@@ -559,7 +580,7 @@ pub enum MediaFeature<'i> {
   /// An interval, e.g. `(120px < width < 240px)`.
   Interval {
     /// The name of the feature.
-    name: CowArcStr<'i>,
+    name: Ident<'i>,
     /// A start value.
     start: MediaFeatureValue<'i>,
     /// A comparator for the start value.
@@ -583,7 +604,7 @@ impl<'i> Parse<'i> for MediaFeature<'i> {
 
 impl<'i> MediaFeature<'i> {
   fn parse_name_first<'t>(input: &mut Parser<'i, 't>) -> Result<Self, ParseError<'i, ParserError<'i>>> {
-    let name = input.expect_ident()?.into();
+    let name = Ident::parse(input)?;
 
     let operator = input.try_parse(|input| consume_operation_or_colon(input, true));
     let operator = match operator {
@@ -603,7 +624,7 @@ impl<'i> MediaFeature<'i> {
   fn parse_value_first<'t>(input: &mut Parser<'i, 't>) -> Result<Self, ParseError<'i, ParserError<'i>>> {
     let value = MediaFeatureValue::parse(input)?;
     let operator = consume_operation_or_colon(input, false)?;
-    let name = input.expect_ident()?.into();
+    let name = Ident::parse(input)?;
 
     if let Ok(end_operator) = input.try_parse(|input| consume_operation_or_colon(input, false)) {
       let start_operator = operator.unwrap();
@@ -644,10 +665,10 @@ impl<'i> ToCss for MediaFeature<'i> {
 
     match self {
       MediaFeature::Boolean(name) => {
-        serialize_identifier(name, dest)?;
+        name.to_css(dest)?;
       }
       MediaFeature::Plain { name, value } => {
-        serialize_identifier(name, dest)?;
+        name.to_css(dest)?;
         dest.delim(':', false)?;
         value.to_css(dest)?;
       }
@@ -659,7 +680,7 @@ impl<'i> ToCss for MediaFeature<'i> {
           }
         }
 
-        serialize_identifier(name, dest)?;
+        name.to_css(dest)?;
         operator.to_css(dest)?;
         value.to_css(dest)?;
       }
@@ -680,7 +701,7 @@ impl<'i> ToCss for MediaFeature<'i> {
 
         start.to_css(dest)?;
         start_operator.to_css(dest)?;
-        serialize_identifier(name, dest)?;
+        name.to_css(dest)?;
         end_operator.to_css(dest)?;
         end.to_css(dest)?;
       }
@@ -693,7 +714,7 @@ impl<'i> ToCss for MediaFeature<'i> {
 #[inline]
 fn write_min_max<W>(
   operator: &MediaFeatureComparison,
-  name: &str,
+  name: &Ident,
   value: &MediaFeatureValue,
   dest: &mut Printer<W>,
 ) -> Result<(), PrinterError>
@@ -710,7 +731,7 @@ where
     dest.write_str(prefix)?;
   }
 
-  serialize_identifier(name, dest)?;
+  name.to_css(dest)?;
   dest.delim(':', false)?;
 
   let adjusted = match operator {
@@ -732,7 +753,7 @@ where
 /// [media feature value](https://drafts.csswg.org/mediaqueries/#typedef-mf-value) within a media query.
 ///
 /// See [MediaFeature](MediaFeature).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Visit)]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
@@ -749,7 +770,7 @@ pub enum MediaFeatureValue<'i> {
   Ratio(Ratio),
   /// An indentifier.
   #[cfg_attr(feature = "serde", serde(borrow))]
-  Ident(CowArcStr<'i>),
+  Ident(Ident<'i>),
 }
 
 impl<'i> Parse<'i> for MediaFeatureValue<'i> {
@@ -774,8 +795,8 @@ impl<'i> Parse<'i> for MediaFeatureValue<'i> {
       return Ok(MediaFeatureValue::Resolution(res));
     }
 
-    let ident = input.expect_ident()?;
-    Ok(MediaFeatureValue::Ident(ident.into()))
+    let ident = Ident::parse(input)?;
+    Ok(MediaFeatureValue::Ident(ident))
   }
 }
 
@@ -790,7 +811,7 @@ impl<'i> ToCss for MediaFeatureValue<'i> {
       MediaFeatureValue::Resolution(res) => res.to_css(dest),
       MediaFeatureValue::Ratio(ratio) => ratio.to_css(dest),
       MediaFeatureValue::Ident(id) => {
-        serialize_identifier(id, dest)?;
+        id.to_css(dest)?;
         Ok(())
       }
     }
@@ -852,7 +873,7 @@ fn process_condition<'i>(
   media_type: &mut MediaType<'i>,
   qualifier: &mut Option<Qualifier>,
   condition: &mut MediaCondition<'i>,
-  seen: &mut HashSet<CowArcStr<'i>>,
+  seen: &mut HashSet<Ident<'i>>,
 ) -> Result<bool, MinifyError> {
   match condition {
     MediaCondition::Not(cond) => {
@@ -873,20 +894,8 @@ fn process_condition<'i>(
         MediaCondition::Not(cond) => {
           *condition = (**cond).clone();
         }
-        MediaCondition::InParens(parens) => {
-          if let MediaCondition::Not(cond) = &**parens {
-            *condition = (**cond).clone();
-          }
-        }
         _ => {}
       }
-    }
-    MediaCondition::InParens(cond) => {
-      let res = process_condition(loc, custom_media, media_type, qualifier, &mut *cond, seen);
-      if let MediaCondition::InParens(cond) = &**cond {
-        *condition = (**cond).clone();
-      }
-      return res;
     }
     MediaCondition::Operation(conditions, _) => {
       let mut res = Ok(true);
@@ -913,7 +922,7 @@ fn process_condition<'i>(
         });
       }
 
-      let rule = custom_media.get(name).ok_or_else(|| ErrorWithLocation {
+      let rule = custom_media.get(&name.0).ok_or_else(|| ErrorWithLocation {
         kind: MinifyErrorKind::CustomMediaNotDefined { name: name.to_string() },
         loc,
       })?;
@@ -957,8 +966,8 @@ fn process_condition<'i>(
             }
             // Parentheses are required around the condition unless there is a single media feature.
             match condition {
-              MediaCondition::Feature(..) | MediaCondition::InParens(..) => Some(condition),
-              _ => Some(MediaCondition::InParens(Box::new(condition))),
+              MediaCondition::Feature(..) => Some(condition),
+              _ => Some(condition),
             }
           } else {
             None
@@ -979,7 +988,7 @@ fn process_condition<'i>(
       if conditions.len() == 1 {
         *condition = conditions.pop().unwrap();
       } else {
-        *condition = MediaCondition::InParens(Box::new(MediaCondition::Operation(conditions, Operator::Or)));
+        *condition = MediaCondition::Operation(conditions, Operator::Or);
       }
     }
     _ => {}
@@ -991,7 +1000,7 @@ fn process_condition<'i>(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::stylesheet::PrinterOptions;
+  use crate::{stylesheet::PrinterOptions, targets::Browsers};
 
   fn parse(s: &str) -> MediaQuery {
     let mut input = ParserInput::new(&s);
@@ -1037,5 +1046,21 @@ mod tests {
     assert_eq!(and("all", "only screen"), "only screen");
     assert_eq!(and("only screen", "all"), "only screen");
     assert_eq!(and("print", "print"), "print");
+  }
+
+  #[test]
+  fn test_negated_interval_parens() {
+    let media_query = parse("screen and not (200px <= width < 500px)");
+    let printer_options = PrinterOptions {
+      targets: Some(Browsers {
+        chrome: Some(95 << 16),
+        ..Default::default()
+      }),
+      ..Default::default()
+    };
+    assert_eq!(
+      media_query.to_css_string(printer_options).unwrap(),
+      "screen and not ((min-width: 200px) and (max-width: 499.999px))"
+    );
   }
 }
