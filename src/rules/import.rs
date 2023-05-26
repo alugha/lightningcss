@@ -9,26 +9,31 @@ use crate::media_query::MediaList;
 use crate::printer::Printer;
 use crate::traits::ToCss;
 use crate::values::string::CowArcStr;
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 
 /// A [@import](https://drafts.csswg.org/css-cascade/#at-import) rule.
-#[derive(Debug, PartialEq, Clone, Visit)]
+#[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct ImportRule<'i> {
   /// The url to import.
   #[cfg_attr(feature = "serde", serde(borrow))]
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub url: CowArcStr<'i>,
   /// An optional cascade layer name, or `None` for an anonymous layer.
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub layer: Option<Option<LayerName<'i>>>,
   /// An optional `supports()` condition.
   pub supports: Option<SupportsCondition<'i>>,
   /// A media query.
+  #[cfg_attr(feature = "serde", serde(default))]
   pub media: MediaList<'i>,
   /// The location of the rule in the source file.
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub loc: Location,
 }
 
@@ -43,6 +48,7 @@ impl<'i> ToCss for ImportRule<'i> {
       None
     };
 
+    #[cfg(feature = "sourcemap")]
     dest.add_mapping(self.loc);
     dest.write_str("@import ")?;
     if let Some(dep) = dep {
@@ -66,10 +72,7 @@ impl<'i> ToCss for ImportRule<'i> {
 
     if let Some(supports) = &self.supports {
       dest.write_str(" supports")?;
-      if matches!(
-        supports,
-        SupportsCondition::Declaration(_) | SupportsCondition::Parens(_)
-      ) {
+      if matches!(supports, SupportsCondition::Declaration { .. }) {
         supports.to_css(dest)?;
       } else {
         dest.write_char('(')?;

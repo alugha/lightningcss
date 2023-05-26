@@ -6,7 +6,7 @@ use crate::parser::SelectorImpl;
 use cssparser::ToCss;
 use std::fmt;
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Hash)]
 pub struct AttrSelectorWithOptionalNamespace<'i, Impl: SelectorImpl<'i>> {
   pub namespace: Option<NamespaceConstraint<(Impl::NamespacePrefix, Impl::NamespaceUrl)>>,
   pub local_name: Impl::LocalName,
@@ -24,7 +24,17 @@ impl<'i, Impl: SelectorImpl<'i>> AttrSelectorWithOptionalNamespace<'i, Impl> {
   }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Hash)]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(tag = "type", rename_all = "kebab-case")
+)]
+#[cfg_attr(
+  feature = "jsonschema",
+  derive(schemars::JsonSchema),
+  schemars(rename = "NamespaceConstraint")
+)]
 pub enum NamespaceConstraint<NamespaceUrl> {
   Any,
 
@@ -32,7 +42,7 @@ pub enum NamespaceConstraint<NamespaceUrl> {
   Specific(NamespaceUrl),
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Hash)]
 pub enum ParsedAttrSelectorOperation<AttrValue> {
   Exists,
   WithValue {
@@ -42,7 +52,6 @@ pub enum ParsedAttrSelectorOperation<AttrValue> {
   },
 }
 
-#[derive(Clone, Eq, PartialEq)]
 pub enum AttrSelectorOperation<AttrValue> {
   Exists,
   WithValue {
@@ -68,7 +77,13 @@ impl<AttrValue> AttrSelectorOperation<AttrValue> {
   }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum AttrSelectorOperator {
   Equal,
   Includes,
@@ -124,7 +139,13 @@ impl AttrSelectorOperator {
 /// The definition of whitespace per CSS Selectors Level 3 § 4.
 pub static SELECTOR_WHITESPACE: &[char] = &[' ', '\t', '\n', '\r', '\x0C'];
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum ParsedCaseSensitivity {
   // 's' was specified.
   ExplicitCaseSensitive,
@@ -134,6 +155,12 @@ pub enum ParsedCaseSensitivity {
   CaseSensitive,
   // No flags were specified and HTML says this is a case-insensitive attribute.
   AsciiCaseInsensitiveIfInHtmlElementInHtmlDocument,
+}
+
+impl Default for ParsedCaseSensitivity {
+  fn default() -> Self {
+    ParsedCaseSensitivity::CaseSensitive
+  }
 }
 
 impl ParsedCaseSensitivity {
@@ -153,7 +180,7 @@ impl ParsedCaseSensitivity {
   }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum CaseSensitivity {
   CaseSensitive,
   AsciiCaseInsensitive,

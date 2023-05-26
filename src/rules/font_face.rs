@@ -5,37 +5,45 @@ use crate::error::{ParserError, PrinterError};
 use crate::macros::enum_property;
 use crate::printer::Printer;
 use crate::properties::custom::CustomProperty;
-use crate::properties::font::{FontFamily, FontStretch, FontStyle, FontWeight};
+use crate::properties::font::{FontFamily, FontStretch, FontStyle as FontStyleProperty, FontWeight};
 use crate::stylesheet::ParserOptions;
 use crate::traits::{Parse, ToCss};
+use crate::values::angle::Angle;
 use crate::values::size::Size2D;
 use crate::values::string::CowArcStr;
 use crate::values::url::Url;
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 use std::fmt::Write;
 
 /// A [@font-face](https://drafts.csswg.org/css-fonts/#font-face-rule) rule.
-#[derive(Debug, PartialEq, Clone, Visit)]
+#[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct FontFaceRule<'i> {
   /// Declarations in the `@font-face` rule.
   #[cfg_attr(feature = "serde", serde(borrow))]
   pub properties: Vec<FontFaceProperty<'i>>,
   /// The location of the rule in the source file.
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub loc: Location,
 }
 
 /// A property within an `@font-face` rule.
 ///
 /// See [FontFaceRule](FontFaceRule).
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
   serde(tag = "type", content = "value", rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum FontFaceProperty<'i> {
   /// The `src` property.
   #[cfg_attr(feature = "serde", serde(borrow))]
@@ -56,12 +64,15 @@ pub enum FontFaceProperty<'i> {
 
 /// A value for the [src](https://drafts.csswg.org/css-fonts/#src-desc)
 /// property in an `@font-face` rule.
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
   serde(tag = "type", content = "value", rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum Source<'i> {
   /// A `url()` with optional format metadata.
   Url(UrlSource<'i>),
@@ -107,8 +118,11 @@ impl<'i> ToCss for Source<'i> {
 
 /// A `url()` value for the [src](https://drafts.csswg.org/css-fonts/#src-desc)
 /// property in an `@font-face` rule.
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct UrlSource<'i> {
   /// The URL.
   pub url: Url<'i>,
@@ -165,12 +179,15 @@ impl<'i> ToCss for UrlSource<'i> {
 /// A font format keyword in the `format()` function of the the
 /// [src](https://drafts.csswg.org/css-fonts/#src-desc)
 /// property of an `@font-face` rule.
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
-  serde(tag = "type", content = "value", rename_all = "kebab-case")
+  serde(tag = "type", content = "value", rename_all = "lowercase")
 )]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum FontFormat<'i> {
   /// [src](https://drafts.csswg.org/css-fonts/#font-format-definitions)
   /// A WOFF 1.0 font.
@@ -182,6 +199,7 @@ pub enum FontFormat<'i> {
   /// An OpenType font.
   OpenType,
   /// An Embedded OpenType (.eot) font.
+  #[cfg_attr(feature = "serde", serde(rename = "embedded-opentype"))]
   EmbeddedOpenType,
   /// OpenType Collection.
   Collection,
@@ -278,8 +296,10 @@ enum_property! {
 /// A contiguous range of Unicode code points.
 ///
 /// Cannot be empty. Can represent a single code point when start == end.
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct UnicodeRange {
   /// Inclusive start of the range. In [0, end].
   pub start: u32,
@@ -350,6 +370,73 @@ impl ToCss for UnicodeRange {
   }
 }
 
+/// A value for the [font-style](https://w3c.github.io/csswg-drafts/css-fonts/#descdef-font-face-font-style) descriptor in an `@font-face` rule.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(tag = "type", content = "value", rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
+pub enum FontStyle {
+  /// Normal font style.
+  Normal,
+  /// Italic font style.
+  Italic,
+  /// Oblique font style, with a custom angle.
+  Oblique(#[cfg_attr(feature = "serde", serde(default = "FontStyle::default_oblique_angle"))] Size2D<Angle>),
+}
+
+impl Default for FontStyle {
+  fn default() -> FontStyle {
+    FontStyle::Normal
+  }
+}
+
+impl FontStyle {
+  #[inline]
+  fn default_oblique_angle() -> Size2D<Angle> {
+    Size2D(
+      FontStyleProperty::default_oblique_angle(),
+      FontStyleProperty::default_oblique_angle(),
+    )
+  }
+}
+
+impl<'i> Parse<'i> for FontStyle {
+  fn parse<'t>(input: &mut Parser<'i, 't>) -> Result<Self, ParseError<'i, ParserError<'i>>> {
+    Ok(match FontStyleProperty::parse(input)? {
+      FontStyleProperty::Normal => FontStyle::Normal,
+      FontStyleProperty::Italic => FontStyle::Italic,
+      FontStyleProperty::Oblique(angle) => {
+        let second_angle = input.try_parse(Angle::parse).unwrap_or_else(|_| angle.clone());
+        FontStyle::Oblique(Size2D(angle, second_angle))
+      }
+    })
+  }
+}
+
+impl ToCss for FontStyle {
+  fn to_css<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError>
+  where
+    W: std::fmt::Write,
+  {
+    match self {
+      FontStyle::Normal => dest.write_str("normal"),
+      FontStyle::Italic => dest.write_str("italic"),
+      FontStyle::Oblique(angle) => {
+        dest.write_str("oblique")?;
+        if *angle != FontStyle::default_oblique_angle() {
+          dest.write_char(' ')?;
+          angle.to_css(dest)?;
+        }
+        Ok(())
+      }
+    }
+  }
+}
+
 pub(crate) struct FontFaceDeclarationParser;
 
 /// Parse a declaration within {} block: `color: blue`
@@ -365,7 +452,9 @@ impl<'i> cssparser::DeclarationParser<'i> for FontFaceDeclarationParser {
     macro_rules! property {
       ($property: ident, $type: ty) => {
         if let Ok(c) = <$type>::parse(input) {
-          return Ok(FontFaceProperty::$property(c));
+          if input.expect_exhausted().is_ok() {
+            return Ok(FontFaceProperty::$property(c));
+          }
         }
       };
     }
@@ -406,6 +495,7 @@ impl<'i> ToCss for FontFaceRule<'i> {
   where
     W: std::fmt::Write,
   {
+    #[cfg(feature = "sourcemap")]
     dest.add_mapping(self.loc);
     dest.write_str("@font-face")?;
     dest.whitespace()?;

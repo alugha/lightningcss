@@ -8,6 +8,7 @@ use crate::printer::Printer;
 use crate::stylesheet::ParserOptions;
 use crate::traits::{Parse, ToCss};
 use crate::values::string::CowArcStr;
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 
@@ -16,7 +17,13 @@ use cssparser::*;
 ///
 /// Either a name or at least one pseudo class is required.
 #[derive(Debug, PartialEq, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct PageSelector<'i> {
   /// An optional named page type.
   #[cfg_attr(feature = "serde", serde(borrow))]
@@ -113,8 +120,15 @@ enum_property! {
 }
 
 /// A [page margin rule](https://www.w3.org/TR/css-page-3/#margin-at-rules) rule.
-#[derive(Debug, PartialEq, Clone, Visit)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct PageMarginRule<'i> {
   /// The margin box identifier for this rule.
   pub margin_box: PageMarginBox,
@@ -122,7 +136,7 @@ pub struct PageMarginRule<'i> {
   #[cfg_attr(feature = "serde", serde(borrow))]
   pub declarations: DeclarationBlock<'i>,
   /// The location of the rule in the source file.
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub loc: Location,
 }
 
@@ -131,6 +145,7 @@ impl<'i> ToCss for PageMarginRule<'i> {
   where
     W: std::fmt::Write,
   {
+    #[cfg(feature = "sourcemap")]
     dest.add_mapping(self.loc);
     dest.write_char('@')?;
     self.margin_box.to_css(dest)?;
@@ -139,28 +154,31 @@ impl<'i> ToCss for PageMarginRule<'i> {
 }
 
 /// A [@page](https://www.w3.org/TR/css-page-3/#at-page-rule) rule.
-#[derive(Debug, PartialEq, Clone, Visit)]
+#[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct PageRule<'i> {
   /// A list of page selectors.
   #[cfg_attr(feature = "serde", serde(borrow))]
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub selectors: Vec<PageSelector<'i>>,
   /// The declarations within the `@page` rule.
   pub declarations: DeclarationBlock<'i>,
   /// The nested margin rules.
   pub rules: Vec<PageMarginRule<'i>>,
   /// The location of the rule in the source file.
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub loc: Location,
 }
 
 impl<'i> PageRule<'i> {
-  pub(crate) fn parse<'t, 'o, T>(
+  pub(crate) fn parse<'t, 'o>(
     selectors: Vec<PageSelector<'i>>,
     input: &mut Parser<'i, 't>,
     loc: Location,
-    options: &ParserOptions<'o, 'i, T>,
+    options: &ParserOptions<'o, 'i>,
   ) -> Result<Self, ParseError<'i, ParserError<'i>>> {
     let mut declarations = DeclarationBlock::new();
     let mut rules = Vec::new();
@@ -197,6 +215,7 @@ impl<'i> ToCss for PageRule<'i> {
   where
     W: std::fmt::Write,
   {
+    #[cfg(feature = "sourcemap")]
     dest.add_mapping(self.loc);
     dest.write_str("@page")?;
     if let Some(first) = self.selectors.first() {
@@ -282,13 +301,13 @@ impl<'i> ToCss for PageSelector<'i> {
   }
 }
 
-struct PageRuleParser<'a, 'o, 'i, T> {
+struct PageRuleParser<'a, 'o, 'i> {
   declarations: &'a mut DeclarationBlock<'i>,
   rules: &'a mut Vec<PageMarginRule<'i>>,
-  options: &'a ParserOptions<'o, 'i, T>,
+  options: &'a ParserOptions<'o, 'i>,
 }
 
-impl<'a, 'o, 'i, T> cssparser::DeclarationParser<'i> for PageRuleParser<'a, 'o, 'i, T> {
+impl<'a, 'o, 'i> cssparser::DeclarationParser<'i> for PageRuleParser<'a, 'o, 'i> {
   type Declaration = ();
   type Error = ParserError<'i>;
 
@@ -307,7 +326,7 @@ impl<'a, 'o, 'i, T> cssparser::DeclarationParser<'i> for PageRuleParser<'a, 'o, 
   }
 }
 
-impl<'a, 'o, 'i, T> AtRuleParser<'i> for PageRuleParser<'a, 'o, 'i, T> {
+impl<'a, 'o, 'i> AtRuleParser<'i> for PageRuleParser<'a, 'o, 'i> {
   type Prelude = PageMarginBox;
   type AtRule = ();
   type Error = ParserError<'i>;

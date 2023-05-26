@@ -12,21 +12,24 @@ use crate::printer::Printer;
 use crate::properties::custom::UnparsedProperty;
 use crate::properties::{Property, PropertyId};
 use crate::targets::Browsers;
-use crate::traits::{FallbackValues, Parse, PropertyHandler, Shorthand, ToCss};
+use crate::traits::{FallbackValues, IsCompatible, Parse, PropertyHandler, Shorthand, ToCss};
 use crate::values::color::{ColorFallbackKind, CssColor};
 use crate::values::length::*;
 use crate::values::rect::Rect;
 use crate::values::size::Size2D;
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 
 /// A value for the [border-width](https://www.w3.org/TR/css-backgrounds-3/#border-width) property.
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
   serde(tag = "type", content = "value", rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum BorderSideWidth {
   /// A UA defined `thin` value.
   Thin,
@@ -41,6 +44,15 @@ pub enum BorderSideWidth {
 impl Default for BorderSideWidth {
   fn default() -> BorderSideWidth {
     BorderSideWidth::Medium
+  }
+}
+
+impl IsCompatible for BorderSideWidth {
+  fn is_compatible(&self, browsers: Browsers) -> bool {
+    match self {
+      BorderSideWidth::Length(length) => length.is_compatible(browsers),
+      _ => true,
+    }
   }
 }
 
@@ -107,9 +119,17 @@ impl Default for LineStyle {
   }
 }
 
+impl IsCompatible for LineStyle {
+  fn is_compatible(&self, _browsers: Browsers) -> bool {
+    true
+  }
+}
+
 /// A generic type that represents the `border` and `outline` shorthand properties.
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct GenericBorder<S, const P: u8> {
   /// The width of the border.
   pub width: BorderSideWidth,
@@ -494,6 +514,56 @@ impl BorderShorthand {
   }
 }
 
+property_bitflags! {
+  #[derive(Debug)]
+  struct BorderProperty: u32 {
+    const BorderTopColor = 1 << 0;
+    const BorderBottomColor = 1 << 1;
+    const BorderLeftColor = 1 << 2;
+    const BorderRightColor = 1 << 3;
+    const BorderBlockStartColor = 1 << 4;
+    const BorderBlockEndColor = 1 << 5;
+    const BorderBlockColor = Self::BorderBlockStartColor.bits() | Self::BorderBlockEndColor.bits();
+    const BorderInlineStartColor = 1 << 6;
+    const BorderInlineEndColor = 1 << 7;
+    const BorderInlineColor = Self::BorderInlineStartColor.bits() | Self::BorderInlineEndColor.bits();
+    const BorderTopWidth = 1 << 8;
+    const BorderBottomWidth = 1 << 9;
+    const BorderLeftWidth = 1 << 10;
+    const BorderRightWidth = 1 << 11;
+    const BorderBlockStartWidth = 1 << 12;
+    const BorderBlockEndWidth = 1 << 13;
+    const BorderBlockWidth = Self::BorderBlockStartWidth.bits() | Self::BorderBlockEndWidth.bits();
+    const BorderInlineStartWidth = 1 << 14;
+    const BorderInlineEndWidth = 1 << 15;
+    const BorderInlineWidth = Self::BorderInlineStartWidth.bits() | Self::BorderInlineEndWidth.bits();
+    const BorderTopStyle = 1 << 16;
+    const BorderBottomStyle = 1 << 17;
+    const BorderLeftStyle = 1 << 18;
+    const BorderRightStyle = 1 << 19;
+    const BorderBlockStartStyle = 1 << 20;
+    const BorderBlockEndStyle = 1 << 21;
+    const BorderBlockStyle = Self::BorderBlockStartStyle.bits() | Self::BorderBlockEndStyle.bits();
+    const BorderInlineStartStyle = 1 << 22;
+    const BorderInlineEndStyle = 1 << 23;
+    const BorderInlineStyle = Self::BorderInlineStartStyle.bits() | Self::BorderInlineEndStyle.bits();
+    const BorderTop = Self::BorderTopColor.bits() | Self::BorderTopWidth.bits() | Self::BorderTopStyle.bits();
+    const BorderBottom = Self::BorderBottomColor.bits() | Self::BorderBottomWidth.bits() | Self::BorderBottomStyle.bits();
+    const BorderLeft = Self::BorderLeftColor.bits() | Self::BorderLeftWidth.bits() | Self::BorderLeftStyle.bits();
+    const BorderRight = Self::BorderRightColor.bits() | Self::BorderRightWidth.bits() | Self::BorderRightStyle.bits();
+    const BorderBlockStart = Self::BorderBlockStartColor.bits() | Self::BorderBlockStartWidth.bits() | Self::BorderBlockStartStyle.bits();
+    const BorderBlockEnd = Self::BorderBlockEndColor.bits() | Self::BorderBlockEndWidth.bits() | Self::BorderBlockEndStyle.bits();
+    const BorderInlineStart = Self::BorderInlineStartColor.bits() | Self::BorderInlineStartWidth.bits() | Self::BorderInlineStartStyle.bits();
+    const BorderInlineEnd = Self::BorderInlineEndColor.bits() | Self::BorderInlineEndWidth.bits() | Self::BorderInlineEndStyle.bits();
+    const BorderBlock = Self::BorderBlockStart.bits() | Self::BorderBlockEnd.bits();
+    const BorderInline = Self::BorderInlineStart.bits() | Self::BorderInlineEnd.bits();
+    const BorderWidth = Self::BorderLeftWidth.bits() | Self::BorderRightWidth.bits() | Self::BorderTopWidth.bits() | Self::BorderBottomWidth.bits();
+    const BorderStyle = Self::BorderLeftStyle.bits() | Self::BorderRightStyle.bits() | Self::BorderTopStyle.bits() | Self::BorderBottomStyle.bits();
+    const BorderColor = Self::BorderLeftColor.bits() | Self::BorderRightColor.bits() | Self::BorderTopColor.bits() | Self::BorderBottomColor.bits();
+    const Border = Self::BorderWidth.bits() | Self::BorderStyle.bits() | Self::BorderColor.bits();
+  }
+}
+
 #[derive(Debug)]
 pub(crate) struct BorderHandler<'i> {
   targets: Option<Browsers>,
@@ -508,6 +578,7 @@ pub(crate) struct BorderHandler<'i> {
   category: PropertyCategory,
   border_image_handler: BorderImageHandler<'i>,
   border_radius_handler: BorderRadiusHandler<'i>,
+  flushed_properties: BorderProperty,
   has_any: bool,
 }
 
@@ -526,6 +597,7 @@ impl<'i> BorderHandler<'i> {
       category: PropertyCategory::default(),
       border_image_handler: BorderImageHandler::new(targets),
       border_radius_handler: BorderRadiusHandler::new(targets),
+      flushed_properties: BorderProperty::empty(),
       has_any: false,
     }
   }
@@ -540,11 +612,21 @@ impl<'i> PropertyHandler<'i> for BorderHandler<'i> {
   ) -> bool {
     use Property::*;
 
-    macro_rules! property {
+    macro_rules! flush {
       ($key: ident, $prop: ident, $val: expr, $category: ident) => {{
         if PropertyCategory::$category != self.category {
           self.flush(dest, context);
         }
+
+        if self.$key.$prop.is_some() && matches!(context.targets, Some(targets) if !$val.is_compatible(targets)) {
+          self.flush(dest, context);
+        }
+      }};
+    }
+
+    macro_rules! property {
+      ($key: ident, $prop: ident, $val: expr, $category: ident) => {{
+        flush!($key, $prop, $val, $category);
         self.$key.$prop = Some($val.clone());
         self.category = PropertyCategory::$category;
         self.has_any = true;
@@ -628,10 +710,10 @@ impl<'i> PropertyHandler<'i> for BorderHandler<'i> {
         set_border!(border_inline_end, val, Logical);
       }
       BorderWidth(val) => {
-        self.border_top.width = Some(val.top.clone());
-        self.border_right.width = Some(val.right.clone());
-        self.border_bottom.width = Some(val.bottom.clone());
-        self.border_left.width = Some(val.left.clone());
+        property!(border_top, width, val.top, Physical);
+        property!(border_right, width, val.right, Physical);
+        property!(border_bottom, width, val.bottom, Physical);
+        property!(border_left, width, val.left, Physical);
         self.border_block_start.width = None;
         self.border_block_end.width = None;
         self.border_inline_start.width = None;
@@ -639,10 +721,10 @@ impl<'i> PropertyHandler<'i> for BorderHandler<'i> {
         self.has_any = true;
       }
       BorderStyle(val) => {
-        self.border_top.style = Some(val.top.clone());
-        self.border_right.style = Some(val.right.clone());
-        self.border_bottom.style = Some(val.bottom.clone());
-        self.border_left.style = Some(val.left.clone());
+        property!(border_top, style, val.top, Physical);
+        property!(border_right, style, val.right, Physical);
+        property!(border_bottom, style, val.bottom, Physical);
+        property!(border_left, style, val.left, Physical);
         self.border_block_start.style = None;
         self.border_block_end.style = None;
         self.border_inline_start.style = None;
@@ -650,10 +732,10 @@ impl<'i> PropertyHandler<'i> for BorderHandler<'i> {
         self.has_any = true;
       }
       BorderColor(val) => {
-        self.border_top.color = Some(val.top.clone());
-        self.border_right.color = Some(val.right.clone());
-        self.border_bottom.color = Some(val.bottom.clone());
-        self.border_left.color = Some(val.left.clone());
+        property!(border_top, color, val.top, Physical);
+        property!(border_right, color, val.right, Physical);
+        property!(border_bottom, color, val.bottom, Physical);
+        property!(border_left, color, val.left, Physical);
         self.border_block_start.color = None;
         self.border_block_end.color = None;
         self.border_inline_start.color = None;
@@ -694,6 +776,7 @@ impl<'i> PropertyHandler<'i> for BorderHandler<'i> {
 
   fn finalize(&mut self, dest: &mut DeclarationList<'i>, context: &mut PropertyHandlerContext<'i, '_>) {
     self.flush(dest, context);
+    self.flushed_properties = BorderProperty::empty();
     self.border_image_handler.finalize(dest, context);
     self.border_radius_handler.finalize(dest, context);
   }
@@ -715,16 +798,25 @@ impl<'i> BorderHandler<'i> {
       }};
     }
 
+    macro_rules! push {
+      ($prop: ident, $val: expr) => {{
+        self.flushed_properties.insert(BorderProperty::$prop);
+        dest.push(Property::$prop($val));
+      }};
+    }
+
     macro_rules! fallbacks {
       ($prop: ident => $val: expr) => {{
         let mut val = $val;
         if let Some(targets) = self.targets {
-          let fallbacks = val.get_fallbacks(targets);
-          for fallback in fallbacks {
-            dest.push(Property::$prop(fallback))
+          if !self.flushed_properties.contains(BorderProperty::$prop) {
+            let fallbacks = val.get_fallbacks(targets);
+            for fallback in fallbacks {
+              dest.push(Property::$prop(fallback))
+            }
           }
         }
-        dest.push(Property::$prop(val))
+        push!($prop, val);
       }};
     }
 
@@ -738,7 +830,7 @@ impl<'i> BorderHandler<'i> {
       };
       (BorderInlineStartWidth => $val: expr) => {
         if logical_supported {
-          dest.push(Property::BorderInlineStartWidth($val));
+          push!(BorderInlineStartWidth, $val);
         } else {
           logical_prop!(BorderLeftWidth, border_left_width, BorderRightWidth, border_right_width, $val);
         }
@@ -752,7 +844,7 @@ impl<'i> BorderHandler<'i> {
       };
       (BorderInlineStartStyle => $val: expr) => {
         if logical_supported {
-          dest.push(Property::BorderInlineStartStyle($val));
+          push!(BorderInlineStartStyle, $val);
         } else {
           logical_prop!(BorderLeftStyle, border_left_style, BorderRightStyle, border_right_style, $val);
         }
@@ -766,7 +858,7 @@ impl<'i> BorderHandler<'i> {
       };
       (BorderInlineEndWidth => $val: expr) => {
         if logical_supported {
-          dest.push(Property::BorderInlineEndWidth($val));
+          push!(BorderInlineEndWidth, $val);
         } else {
           logical_prop!(BorderRightWidth, border_right_width, BorderLeftWidth, border_left_width, $val);
         }
@@ -780,7 +872,7 @@ impl<'i> BorderHandler<'i> {
       };
       (BorderInlineEndStyle => $val: expr) => {
         if logical_supported {
-          dest.push(Property::BorderInlineEndStyle($val));
+          push!(BorderInlineEndStyle, $val);
         } else {
           logical_prop!(BorderRightStyle, border_right_style, BorderLeftStyle, border_left_style, $val);
         }
@@ -794,9 +886,9 @@ impl<'i> BorderHandler<'i> {
       };
       (BorderBlockStartWidth => $val: expr) => {
         if logical_supported {
-          dest.push(Property::BorderBlockStartWidth($val));
+          push!(BorderBlockStartWidth, $val);
         } else {
-          dest.push(Property::BorderTopWidth($val));
+          push!(BorderTopWidth, $val);
         }
       };
       (BorderBlockStartColor => $val: expr) => {
@@ -808,9 +900,9 @@ impl<'i> BorderHandler<'i> {
       };
       (BorderBlockStartStyle => $val: expr) => {
         if logical_supported {
-          dest.push(Property::BorderBlockStartStyle($val));
+          push!(BorderBlockStartStyle, $val);
         } else {
-          dest.push(Property::BorderTopStyle($val));
+          push!(BorderTopStyle, $val);
         }
       };
       (BorderBlockEnd => $val: expr) => {
@@ -822,9 +914,9 @@ impl<'i> BorderHandler<'i> {
       };
       (BorderBlockEndWidth => $val: expr) => {
         if logical_supported {
-          dest.push(Property::BorderBlockEndWidth($val));
+          push!(BorderBlockEndWidth, $val);
         } else {
-          dest.push(Property::BorderBottomWidth($val));
+          push!(BorderBottomWidth, $val);
         }
       };
       (BorderBlockEndColor => $val: expr) => {
@@ -836,9 +928,9 @@ impl<'i> BorderHandler<'i> {
       };
       (BorderBlockEndStyle => $val: expr) => {
         if logical_supported {
-          dest.push(Property::BorderBlockEndStyle($val));
+          push!(BorderBlockEndStyle, $val);
         } else {
-          dest.push(Property::BorderBottomStyle($val));
+          push!(BorderBottomStyle, $val);
         }
       };
       (BorderLeftColor => $val: expr) => {
@@ -896,7 +988,7 @@ impl<'i> BorderHandler<'i> {
         fallbacks!(Border => $val);
       };
       ($prop: ident => $val: expr) => {
-        dest.push(Property::$prop($val))
+        push!($prop, $val);
       };
     }
 
@@ -1249,6 +1341,9 @@ impl<'i> BorderHandler<'i> {
     if logical_supported {
       let mut unparsed = unparsed.clone();
       context.add_unparsed_fallbacks(&mut unparsed);
+      self
+        .flushed_properties
+        .insert(BorderProperty::try_from(&unparsed.property_id).unwrap());
       dest.push(Property::Unparsed(unparsed));
       return;
     }
@@ -1258,6 +1353,7 @@ impl<'i> BorderHandler<'i> {
         let mut unparsed = unparsed.with_property_id(PropertyId::$id);
         context.add_unparsed_fallbacks(&mut unparsed);
         dest.push(Property::Unparsed(unparsed));
+        self.flushed_properties.insert(BorderProperty::$id);
       }};
     }
 
@@ -1300,10 +1396,11 @@ impl<'i> BorderHandler<'i> {
       BorderBlockEndWidth => prop!(BorderBottomWidth),
       BorderBlockEndColor => prop!(BorderBottomColor),
       BorderBlockEndStyle => prop!(BorderBottomStyle),
-      _ => {
+      property_id => {
         let mut unparsed = unparsed.clone();
         context.add_unparsed_fallbacks(&mut unparsed);
         dest.push(Property::Unparsed(unparsed));
+        self.flushed_properties.insert(BorderProperty::try_from(property_id).unwrap());
       }
     }
   }

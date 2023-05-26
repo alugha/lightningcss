@@ -31,10 +31,10 @@ const MDN_BROWSER_MAPPING = {
 };
 
 const latestBrowserVersions = {};
-for(let b in browsers) {
-  let versions = browsers[b].versions.slice(10);
-  for(let i = versions.length - 1; i >= 0; i--) {
-    if(versions[i] != null && versions[i] != "all" && versions[i] != "TP") {
+for (let b in browsers) {
+  let versions = browsers[b].versions.slice(-10);
+  for (let i = versions.length - 1; i >= 0; i--) {
+    if (versions[i] != null && versions[i] != "all" && versions[i] != "TP") {
       latestBrowserVersions[b] = versions[i];
       break;
     }
@@ -87,8 +87,9 @@ for (let prop in prefixes) {
       prefix = 'webkit';
     }
 
-    name = BROWSER_MAPPING[name] || name;
+    let origName = name;
     let isCurrentVersion = version === latestBrowserVersions[name];
+    name = BROWSER_MAPPING[name] || name;
     let v = parseVersion(version);
     if (v == null) {
       console.log('BAD VERSION', prop, name, version);
@@ -96,13 +97,15 @@ for (let prop in prefixes) {
     }
     if (browserMap[name]?.[prefix] == null) {
       browserMap[name] = browserMap[name] || {};
-      browserMap[name][prefix] = isCurrentVersion ? [v, null] : [v, v];
+      browserMap[name][prefix] = prefixes[prop].browsers.filter(b => b.startsWith(origName) || b.startsWith(name)).length === 1
+        ? isCurrentVersion ? [null, null] : [null, v]
+        : isCurrentVersion ? [v, null] : [v, v];
     } else {
       if (v < browserMap[name][prefix][0]) {
         browserMap[name][prefix][0] = v;
       }
 
-      if (isCurrentVersion) {
+      if (isCurrentVersion && browserMap[name][prefix][0] != null) {
         browserMap[name][prefix][1] = null;
       } else if (v > browserMap[name][prefix][1] && browserMap[name][prefix][1] != null) {
         browserMap[name][prefix][1] = v;
@@ -137,6 +140,7 @@ for (let prop in prefixes) {
   }
   addValue(p, browserMap, prop);
 }
+
 
 function addValue(map, value, prop) {
   let s = JSON.stringify(value);
@@ -184,7 +188,9 @@ let cssFeatures = [
   'css-nesting',
   'css-not-sel-list',
   'css-has',
-  'font-family-system-ui'
+  'font-family-system-ui',
+  'extended-system-fonts',
+  'calc'
 ];
 
 let compat = new Map();
@@ -226,7 +232,19 @@ let mdnFeatures = {
   placeItems: mdn.css.properties['place-items'].__compat.support,
   overflowShorthand: mdn.css.properties['overflow'].multiple_keywords.__compat.support,
   mediaRangeSyntax: mdn.css['at-rules'].media.range_syntax.__compat.support,
-  mediaIntervalSyntax: {}, // currently no browsers
+  mediaIntervalSyntax: Object.fromEntries(
+    Object.entries(mdn.css['at-rules'].media.range_syntax.__compat.support)
+      .map(([browser, value]) => {
+        // Firefox supported only ranges and not intervals for a while.
+        if (Array.isArray(value)) {
+          value = value.filter(v => !v.partial_implementation)
+        } else if (value.partial_implementation) {
+          value = undefined;
+        }
+
+        return [browser, value];
+      })
+  ),
   logicalBorders: mdn.css.properties['border-inline-start'].__compat.support,
   logicalBorderShorthand: mdn.css.properties['border-inline'].__compat.support,
   logicalBorderRadius: mdn.css.properties['border-start-start-radius'].__compat.support,
@@ -238,7 +256,7 @@ let mdnFeatures = {
   logicalSize: mdn.css.properties['inline-size'].__compat.support,
   logicalTextAlign: mdn.css.properties['text-align']['flow_relative_values_start_and_end'].__compat.support,
   labColors: mdn.css.types.color.lab.__compat.support,
-  oklabColors: {},
+  oklabColors: mdn.css.types.color.oklab.__compat.support,
   colorFunction: mdn.css.types.color.color.__compat.support,
   spaceSeparatedColorFunction: mdn.css.types.color.rgb.space_separated_parameters.__compat.support,
   textDecorationThicknessPercent: mdn.css.properties['text-decoration-thickness'].percentage.__compat.support,
@@ -251,19 +269,89 @@ let mdnFeatures = {
         if (Array.isArray(value)) {
           value = value
             .filter(v => v.alternative_name?.includes('-any'))
-            .map(({alternative_name, ...other}) => other);
+            .map(({ alternative_name, ...other }) => other);
         }
 
         if (value && value.length) {
           return [key, value];
         } else {
-          return [key, {version_added: false}];
+          return [key, { version_added: false }];
         }
       })
   ),
   imageSet: mdn.css.types.image['image-set'].__compat.support,
-  xResolutionUnit: mdn.css.types.resolution.x.__compat.support
+  xResolutionUnit: mdn.css.types.resolution.x.__compat.support,
+  nthChildOf: mdn.css.selectors['nth-child'].of_syntax.__compat.support,
+  minFunction: mdn.css.types.min.__compat.support,
+  maxFunction: mdn.css.types.max.__compat.support,
+  roundFunction: mdn.css.types.round.__compat.support,
+  remFunction: mdn.css.types.rem.__compat.support,
+  modFunction: mdn.css.types.mod.__compat.support,
+  absFunction: mdn.css.types.abs.__compat.support,
+  signFunction: mdn.css.types.sign.__compat.support,
+  hypotFunction: mdn.css.types.hypot.__compat.support,
+  gradientInterpolationHints: mdn.css.types.image.gradient['linear-gradient'].interpolation_hints.__compat.support,
+  borderImageRepeatRound: mdn.css.properties['border-image-repeat'].round.__compat.support,
+  borderImageRepeatSpace: mdn.css.properties['border-image-repeat'].space.__compat.support,
+  fontSizeRem: mdn.css.properties['font-size'].rem_values.__compat.support,
+  fontSizeXXXLarge: mdn.css.properties['font-size']['xxx-large'].__compat.support,
+  fontStyleObliqueAngle: mdn.css.properties['font-style']['oblique-angle'].__compat.support,
+  fontWeightNumber: mdn.css.properties['font-weight'].number.__compat.support,
+  fontStretchPercentage: mdn.css.properties['font-stretch'].percentage.__compat.support,
 };
+
+for (let key in mdn.css.types.length) {
+  if (key === '__compat') {
+    continue;
+  }
+
+  let feat = key.includes('_')
+    ? key.replace(/_([a-z])/g, (_, l) => l.toUpperCase())
+    : key + 'Unit';
+
+  mdnFeatures[feat] = mdn.css.types.length[key].__compat.support;
+}
+
+for (let key in mdn.css.types.image.gradient) {
+  if (key === '__compat') {
+    continue;
+  }
+
+  let feat = key.replace(/-([a-z])/g, (_, l) => l.toUpperCase());
+  mdnFeatures[feat] = mdn.css.types.image.gradient[key].__compat.support;
+}
+
+const nonStandardListStyleType = new Set([
+  // https://developer.mozilla.org/en-US/docs/Web/CSS/list-style-type#non-standard_extensions
+  'ethiopic-halehame',
+  'ethiopic-halehame-am',
+  'ethiopic-halehame-ti-er',
+  'ethiopic-halehame-ti-et',
+  'hangul',
+  'hangul-consonant',
+  'urdu',
+  'cjk-ideographic',
+  // https://github.com/w3c/csswg-drafts/issues/135
+  'upper-greek'
+]);
+
+for (let key in mdn.css.properties['list-style-type']) {
+  if (key === '__compat' || nonStandardListStyleType.has(key) || mdn.css.properties['list-style-type'][key].__compat.support.chrome.version_removed) {
+    continue;
+  }
+
+  let feat = key[0].toUpperCase() + key.slice(1).replace(/-([a-z])/g, (_, l) => l.toUpperCase()) + 'ListStyleType';
+  mdnFeatures[feat] = mdn.css.properties['list-style-type'][key].__compat.support;
+}
+
+for (let key in mdn.css.properties['width']) {
+  if (key === '__compat' || key === 'animatable') {
+    continue;
+  }
+
+  let feat = key[0].toUpperCase() + key.slice(1).replace(/[-_]([a-z])/g, (_, l) => l.toUpperCase()) + 'Size';
+  mdnFeatures[feat] = mdn.css.properties['width'][key].__compat.support;
+}
 
 for (let feature in mdnFeatures) {
   let browserMap = {};
@@ -275,8 +363,8 @@ for (let feature in mdnFeatures) {
     let feat = mdnFeatures[feature][name];
     let version;
     if (Array.isArray(feat)) {
-      version = feat.find(x => x.version_added && !x.alternative_name).version_added;
-    } else {
+      version = feat.filter(x => x.version_added && !x.alternative_name && !x.flags).sort((a, b) => parseVersion(a.version_added) < parseVersion(b.version_added) ? -1 : 1)[0].version_added;
+    } else if (!feat.alternative_name && !feat.flags) {
       version = feat.version_added;
     }
 
@@ -350,30 +438,36 @@ impl Feature {
     let mut prefixes = VendorPrefix::None;
     match self {
       ${[...p].map(([features, versions]) => {
-        return `${features.map(name => `Feature::${enumify(name)}`).join(' |\n      ')} => {
+  return `${features.map(name => `Feature::${enumify(name)}`).join(' |\n      ')} => {
         ${Object.entries(versions).map(([name, prefixes]) => {
-          return `if let Some(version) = browsers.${name} {
+          let needsVersion = !Object.values(prefixes).every(([min, max]) => min == null && max == null);
+    return `if ${needsVersion ? `let Some(version) = browsers.${name}` : `browsers.${name}.is_some()`} {
           ${Object.entries(prefixes).map(([prefix, [min, max]]) => {
-            if (!prefixMapping[prefix]) {
-              throw new Error('Missing prefix ' + prefix);
-            }
-            let condition;
-            if (max == null) {
-              condition = `version >= ${min}`; 
-            } else if (min == max) {
-              condition = `version == ${min}`;
-            } else {
-              condition = `version >= ${min} && version <= ${max}`;
-            }
+      if (!prefixMapping[prefix]) {
+        throw new Error('Missing prefix ' + prefix);
+      }
+      let addPrefix = `prefixes |= VendorPrefix::${prefixMapping[prefix]};`;
+      let condition;
+      if (min == null && max == null) {
+        return addPrefix;
+      } else if (min == null) {
+        condition = `version <= ${max}`;
+      } else if (max == null) {
+        condition = `version >= ${min}`;
+      } else if (min == max) {
+        condition = `version == ${min}`;
+      } else {
+        condition = `version >= ${min} && version <= ${max}`;
+      }
 
-              return `if ${condition} {
-            prefixes |= VendorPrefix::${prefixMapping[prefix]};
+      return `if ${condition} {
+            ${addPrefix}
           }`
-          }).join('\n          ')}
+    }).join('\n          ')}
         }`;
-        }).join('\n        ')}
+  }).join('\n        ')}
       }`
-      }).join(',\n      ')}
+}).join(',\n      ')}
     }
     prefixes
   }
@@ -381,23 +475,23 @@ impl Feature {
 
 pub fn is_flex_2009(browsers: Browsers) -> bool {
   ${Object.entries(flexSpec).map(([name, [min, max]]) => {
-    return `if let Some(version) = browsers.${name} {
+  return `if let Some(version) = browsers.${name} {
     if version >= ${min} && version <= ${max} {
       return true;
     }
   }`;
-  }).join('\n  ')}
+}).join('\n  ')}
   false
 }
 
 pub fn is_webkit_gradient(browsers: Browsers) -> bool {
   ${Object.entries(oldGradient).map(([name, [min, max]]) => {
-    return `if let Some(version) = browsers.${name} {
+  return `if let Some(version) = browsers.${name} {
     if version >= ${min} && version <= ${max} {
       return true;
     }
   }`;
-  }).join('\n  ')}
+}).join('\n  ')}
   false
 }
 `;
@@ -418,9 +512,9 @@ impl Feature {
   pub fn is_compatible(&self, browsers: Browsers) -> bool {
     match self {
       ${[...compat].map(([features, supportedBrowsers]) =>
-        `${features.map(name => `Feature::${enumify(name)}`).join(' |\n      ')} => {` + (Object.entries(supportedBrowsers).length === 0 ? '\n        return false\n      }' : `
+  `${features.map(name => `Feature::${enumify(name)}`).join(' |\n      ')} => {` + (Object.entries(supportedBrowsers).length === 0 ? '\n        return false\n      }' : `
         ${Object.entries(supportedBrowsers).map(([browser, min]) =>
-            `if let Some(version) = browsers.${browser} {
+    `if let Some(version) = browsers.${browser} {
           if version < ${min} {
             return false
           }
@@ -428,7 +522,7 @@ impl Feature {
           return false
         }`}
       }`
-      )).join('\n      ')}
+  )).join('\n      ')}
     }
     true
   }

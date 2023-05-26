@@ -30,44 +30,49 @@ if (process.argv[process.argv.length - 1] !== __filename) {
 
 let res = css.transform({
   filename: __filename,
-  minify: true,
-  sourceMap: true,
-  targets: {
-    safari: 4 << 16,
-    firefox: 3 << 16 | 5 << 8,
-    opera: 10 << 16 | 5 << 8
-  },
-  code: Buffer.from(`.imported {
-    content: "yay, file support!";
+  code: Buffer.from(`
+  @breakpoints {
+    .foo { color: yellow; }
   }
-  
-  .selector {
-    margin: 1em;
-    background-color: #f60;
-  }
-  
-  .selector .nested {
-    margin: 0.5em;
+
+  .foo {
+    color: red;
+    @bar {
+      width: 25px;
+    }
   }
 `),
-  inputSourceMap: JSON.stringify({
-    "version": 3,
-    "sourceRoot": "root",
-    "file": "stdout",
-    "sources": [
-      "stdin",
-      "sass/_variables.scss",
-      "sass/_demo.scss"
-    ],
-    "sourcesContent": [
-      "@import \"_variables\";\n@import \"_demo\";\n\n.selector {\n  margin: $size;\n  background-color: $brandColor;\n\n  .nested {\n    margin: $size / 2;\n  }\n}",
-      "$brandColor: #f60;\n$size: 1em;",
-      ".imported {\n  content: \"yay, file support!\";\n}"
-    ],
-    "mappings": "AEAA,SAAS,CAAC;EACR,OAAO,EAAE,oBAAqB;CAC/B;;AFCD,SAAS,CAAC;EACR,MAAM,ECHD,GAAG;EDIR,gBAAgB,ECLL,IAAI;CDUhB;;AAPD,SAAS,CAIP,OAAO,CAAC;EACN,MAAM,ECPH,KAAG;CDQP",
-    "names": []
-  }),
+  drafts: {
+    nesting: true
+  },
+  targets: {
+    safari: 16 << 16
+  },
+  customAtRules: {
+    breakpoints: {
+      // Syntax string defining the at rule prelude.
+      // https://drafts.css-houdini.org/css-properties-values-api/#syntax-strings
+      prelude: null,
+      // Type of the at rule block.
+      // Can be declaration-list, rule-list, or style-block.
+      // https://www.w3.org/TR/css-syntax-3/#declaration-rule-list
+      body: 'rule-list'
+    },
+    bar: {
+      body: 'style-block'
+    }
+  },
+  visitor: {
+    Rule: {
+      custom(rule) {
+        console.log(rule.body);
+      }
+    },
+    Length(length) {
+      length.value *= 2;
+      return length;
+    }
+  }
 });
 
 console.log(res.code.toString());
-console.log(res.map.toString())

@@ -9,8 +9,10 @@ macro_rules! enum_property {
     }
   ) => {
     $(#[$outer])*
-    #[derive(Debug, Clone, Copy, PartialEq, Visit)]
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    #[cfg_attr(feature = "visitor", derive(Visit))]
     #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "lowercase"))]
+    #[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
     $vis enum $name {
       $(
         $(#[$meta])*
@@ -45,14 +47,21 @@ macro_rules! enum_property {
       }
     }
 
-    impl ToCss for $name {
-      fn to_css<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError> where W: std::fmt::Write {
+    impl $name {
+      /// Returns a string representation of the value.
+      pub fn as_str(&self) -> &str {
         use $name::*;
         match self {
           $(
-            $x => dest.write_str(&stringify!($x).to_lowercase()),
+            $x => const_str::convert_ascii_case!(lower, stringify!($x)),
           )+
         }
+      }
+    }
+
+    impl ToCss for $name {
+      fn to_css<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError> where W: std::fmt::Write {
+        dest.write_str(self.as_str())
       }
     }
   };
@@ -66,8 +75,9 @@ macro_rules! enum_property {
     }
   ) => {
     $(#[$outer])*
-    #[derive(Debug, Clone, Copy, PartialEq, Visit)]
+    #[derive(Debug, Clone, Copy, PartialEq)] #[cfg_attr(feature = "visitor", derive(Visit))]
     #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+    #[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
     $vis enum $name {
       $(
         $(#[$meta])*
@@ -103,14 +113,21 @@ macro_rules! enum_property {
       }
     }
 
-    impl ToCss for $name {
-      fn to_css<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError> where W: std::fmt::Write {
+    impl $name {
+      /// Returns a string representation of the value.
+      pub fn as_str(&self) -> &str {
         use $name::*;
         match self {
           $(
-            $id => dest.write_str($str),
+            $id => $str,
           )+
         }
+      }
+    }
+
+    impl ToCss for $name {
+      fn to_css<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError> where W: std::fmt::Write {
+        dest.write_str(self.as_str())
       }
     }
   };
@@ -207,62 +224,78 @@ macro_rules! shorthand_property {
 
 pub(crate) use shorthand_property;
 
+macro_rules! shorthand_property_bitflags {
+  ($name:ident, $first:ident, $($rest:ident),*) => {
+    crate::macros::shorthand_property_bitflags!($name, [$first,$($rest),+] $($rest),+ ; 0; $first = 0);
+  };
+  ($name:ident, [$($all:ident),*] $cur:ident, $($rest:ident),* ; $last_index: expr ; $($var:ident = $index:expr)+) => {
+    crate::macros::shorthand_property_bitflags!($name, [$($all),*] $($rest),* ; $last_index + 1; $($var = $index)* $cur = $last_index + 1);
+  };
+  ($name:ident, [$($all:ident),*] $cur:ident; $last_index:expr ; $($var:ident = $index:expr)+) => {
+    paste::paste! {
+      crate::macros::property_bitflags! {
+        #[derive(Default, Debug)]
+        struct [<$name Property>]: u8 {
+          $(const $var = 1 << $index);*;
+          const $cur = 1 << ($last_index + 1);
+          const $name = $(Self::$all.bits())|*;
+        }
+      }
+    }
+  };
+}
+
+pub(crate) use shorthand_property_bitflags;
+
 macro_rules! shorthand_handler {
   (
     $name: ident -> $shorthand: ident$(<$l: lifetime>)? $(fallbacks: $shorthand_fallback: literal)?
     { $( $key: ident: $prop: ident($type: ty $(, fallback: $fallback: literal)? $(, image: $image: literal)?), )+ }
   ) => {
+    crate::macros::shorthand_property_bitflags!($shorthand, $($prop),*);
+
     #[derive(Default)]
     pub(crate) struct $name$(<$l>)? {
-      #[allow(dead_code)]
-      targets: Option<Browsers>,
       $(
         pub $key: Option<$type>,
       )*
+      flushed_properties: paste::paste!([<$shorthand Property>]),
       has_any: bool
-    }
-
-    impl$(<$l>)? $name$(<$l>)? {
-      #[allow(dead_code)]
-      pub fn new(targets: Option<Browsers>) -> Self {
-        Self {
-          targets,
-          ..Self::default()
-        }
-      }
     }
 
     impl<'i> PropertyHandler<'i> for $name$(<$l>)? {
       fn handle_property(&mut self, property: &Property<'i>, dest: &mut DeclarationList<'i>, context: &mut PropertyHandlerContext<'i, '_>) -> bool {
+        use crate::traits::IsCompatible;
+
         match property {
           $(
             Property::$prop(val) => {
-              $(
-                if $image && val.should_preserve_fallback(&self.$key, self.targets) {
-                  self.finalize(dest, context);
-                }
-              )?
+              if self.$key.is_some() && matches!(context.targets, Some(targets) if !val.is_compatible(targets)) {
+                self.flush(dest, context);
+              }
               self.$key = Some(val.clone());
               self.has_any = true;
             },
           )+
           Property::$shorthand(val) => {
             $(
-              $(
-                if $image && val.$key.should_preserve_fallback(&self.$key, self.targets) {
-                  self.finalize(dest, context);
-                }
-              )?
-
+              if self.$key.is_some() && matches!(context.targets, Some(targets) if !val.$key.is_compatible(targets)) {
+                self.flush(dest, context);
+              }
+            )+
+            $(
               self.$key = Some(val.$key.clone());
             )+
             self.has_any = true;
           }
           Property::Unparsed(val) if matches!(val.property_id, $( PropertyId::$prop | )+ PropertyId::$shorthand) => {
-            self.finalize(dest, context);
+            self.flush(dest, context);
 
             let mut unparsed = val.clone();
             context.add_unparsed_fallbacks(&mut unparsed);
+            paste::paste! {
+              self.flushed_properties.insert([<$shorthand Property>]::try_from(&unparsed.property_id).unwrap());
+            };
             dest.push(Property::Unparsed(unparsed));
           }
           _ => return false
@@ -271,7 +304,15 @@ macro_rules! shorthand_handler {
         true
       }
 
-      fn finalize(&mut self, dest: &mut DeclarationList<'i>, _: &mut PropertyHandlerContext<'i, '_>) {
+      fn finalize(&mut self, dest: &mut DeclarationList<'i>, context: &mut PropertyHandlerContext<'i, '_>) {
+        self.flush(dest, context);
+        self.flushed_properties = paste::paste!([<$shorthand Property>]::empty());
+      }
+    }
+
+    impl<'i> $name$(<$l>)? {
+      #[allow(unused_variables)]
+      fn flush(&mut self, dest: &mut DeclarationList<'i>, context: &mut PropertyHandlerContext<'i, '_>) {
         if !self.has_any {
           return
         }
@@ -291,8 +332,8 @@ macro_rules! shorthand_handler {
           };
 
           $(
-            if $shorthand_fallback {
-              if let Some(targets) = self.targets {
+            if $shorthand_fallback && !self.flushed_properties.intersects(paste::paste!([<$shorthand Property>]::$shorthand)) {
+              if let Some(targets) = context.targets {
                 let fallbacks = shorthand.get_fallbacks(targets);
                 for fallback in fallbacks {
                   dest.push(Property::$shorthand(fallback));
@@ -301,14 +342,17 @@ macro_rules! shorthand_handler {
             }
           )?
 
-          dest.push(Property::$shorthand(shorthand))
+          dest.push(Property::$shorthand(shorthand));
+          paste::paste! {
+            self.flushed_properties.insert([<$shorthand Property>]::$shorthand);
+          };
         } else {
           $(
             #[allow(unused_mut)]
             if let Some(mut val) = $key {
               $(
-                if $fallback {
-                  if let Some(targets) = self.targets {
+                if $fallback && !self.flushed_properties.intersects(paste::paste!([<$shorthand Property>]::$prop)) {
+                  if let Some(targets) = context.targets {
                     let fallbacks = val.get_fallbacks(targets);
                     for fallback in fallbacks {
                       dest.push(Property::$prop(fallback));
@@ -317,7 +361,10 @@ macro_rules! shorthand_handler {
                 }
               )?
 
-              dest.push(Property::$prop(val))
+              dest.push(Property::$prop(val));
+              paste::paste! {
+                self.flushed_properties.insert([<$shorthand Property>]::$prop);
+              };
             }
           )+
         }
@@ -339,8 +386,10 @@ macro_rules! define_shorthand {
     }
   ) => {
     $(#[$outer])*
-    #[derive(Debug, Clone, PartialEq, Visit)]
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+    #[derive(Debug, Clone, PartialEq)]
+    #[cfg_attr(feature = "visitor", derive(Visit))]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "camelCase"))]
+    #[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
     pub struct $name$(<$l>)? {
       $(
         $(#[$meta])*
@@ -387,10 +436,13 @@ macro_rules! impl_shorthand {
     impl<'i> Shorthand<'i> for $t {
       #[allow(unused_variables)]
       fn from_longhands(decls: &DeclarationBlock<'i>, vendor_prefix: crate::vendor_prefix::VendorPrefix) -> Option<(Self, bool)> {
+        use paste::paste;
+
         $(
           $(
-            #[allow(non_snake_case)]
-            let mut $prop = None;
+            paste! {
+              let mut [<$prop:snake _value>] = None;
+            }
           )+
         )+
 
@@ -407,7 +459,9 @@ macro_rules! impl_shorthand {
                     }
                   )?
 
-                  $prop = Some(val.clone());
+                  paste! {
+                    [<$prop:snake _value>] = Some(val.clone());
+                  }
                   count += 1;
                   if important {
                     important_count += 1;
@@ -424,7 +478,9 @@ macro_rules! impl_shorthand {
 
               $(
                 $(
-                  $prop = Some(val.$key.clone());
+                  paste! {
+                    [<$prop:snake _value>] = Some(val.$key.clone());
+                  }
                   count += 1;
                   if important {
                     important_count += 1;
@@ -436,7 +492,9 @@ macro_rules! impl_shorthand {
               $(
                 $(
                   if let Some(Property::$prop(longhand $(, vp_name!($vp, _p))?)) = property.longhand(&PropertyId::$prop$((vp_name!($vp, vendor_prefix)))?) {
-                    $prop = Some(longhand);
+                    paste! {
+                      [<$prop:snake _value>] = Some(longhand);
+                    }
                     count += 1;
                     if important {
                       important_count += 1;
@@ -453,14 +511,16 @@ macro_rules! impl_shorthand {
           return None
         }
 
-        if $($($prop.is_some() &&)+)+ true {
+        if $($(paste! { [<$prop:snake _value>].is_some() } &&)+)+ true {
           // All properties in the group must have a matching value to produce a shorthand.
           $(
             let mut $key = None;
             $(
               if $key == None {
-                $key = $prop;
-              } else if $key != $prop {
+                paste! {
+                  $key = [<$prop:snake _value>];
+                }
+              } else if paste! { $key != [<$prop:snake _value>] } {
                 return None
               }
             )+
@@ -553,8 +613,10 @@ macro_rules! define_list_shorthand {
     }
   ) => {
     $(#[$outer])*
-    #[derive(Debug, Clone, PartialEq, Visit)]
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+    #[derive(Debug, Clone, PartialEq)]
+    #[cfg_attr(feature = "visitor", derive(Visit))]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "camelCase"))]
+    #[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
     pub struct $name$(<$l>)? {
       $(
         $(#[$meta])*
@@ -792,3 +854,40 @@ macro_rules! size_shorthand {
 }
 
 pub(crate) use size_shorthand;
+
+macro_rules! property_bitflags {
+  (
+    $(#[$outer:meta])*
+    $vis:vis struct $BitFlags:ident: $T:ty {
+      $(
+        $(#[$inner:ident $($args:tt)*])*
+        const $Flag:ident $(($vp:ident))? = $value:expr;
+      )*
+    }
+  ) => {
+    bitflags::bitflags! {
+      $(#[$outer])*
+      $vis struct $BitFlags: $T {
+        $(
+          $(#[$inner $($args)*])*
+            const $Flag = $value;
+        )*
+      }
+    }
+
+    impl<'i> TryFrom<&PropertyId<'i>> for $BitFlags {
+      type Error = ();
+
+      fn try_from(value: &PropertyId<'i>) -> Result<$BitFlags, Self::Error> {
+        match value {
+          $(
+            PropertyId::$Flag $(($vp))? => Ok($BitFlags::$Flag),
+          )*
+          _ => Err(())
+        }
+      }
+    }
+  };
+}
+
+pub(crate) use property_bitflags;

@@ -2,56 +2,31 @@
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+use at_rule_parser::{AtRule, CustomAtRuleConfig, CustomAtRuleParser};
 use lightningcss::bundler::{BundleErrorKind, Bundler, FileProvider, SourceProvider};
 use lightningcss::css_modules::{CssModuleExports, CssModuleReferences, PatternParseError};
 use lightningcss::dependencies::{Dependency, DependencyOptions};
 use lightningcss::error::{Error, ErrorLocation, MinifyErrorKind, ParserError, PrinterErrorKind};
 use lightningcss::stylesheet::{
-  MinifyOptions, ParserOptions, PrinterOptions, PseudoClasses, StyleAttribute, StyleSheet,
+  MinifyOptions, ParserFlags, ParserOptions, PrinterOptions, PseudoClasses, StyleAttribute, StyleSheet,
 };
 use lightningcss::targets::Browsers;
+use lightningcss::visitor::Visit;
 use parcel_sourcemap::SourceMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, RwLock};
 
+use transformer::JsVisitor;
+
+mod at_rule_parser;
 #[cfg(not(target_arch = "wasm32"))]
 mod threadsafe_function;
+mod transformer;
 
-// ---------------------------------------------
-
-#[cfg(target_arch = "wasm32")]
-use serde_wasm_bindgen::{from_value, Serializer};
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::*;
-
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen]
-pub fn transform(config_val: JsValue) -> Result<JsValue, JsValue> {
-  let config: Config = from_value(config_val).map_err(JsValue::from)?;
-  let code = unsafe { std::str::from_utf8_unchecked(&config.code) };
-  let res = compile(code, &config)?;
-  let serializer = Serializer::new().serialize_maps_as_objects(true);
-  res.serialize(&serializer).map_err(JsValue::from)
-}
-
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen(js_name = "transformStyleAttribute")]
-pub fn transform_style_attribute(config_val: JsValue) -> Result<JsValue, JsValue> {
-  let config: AttrConfig = from_value(config_val).map_err(JsValue::from)?;
-  let code = unsafe { std::str::from_utf8_unchecked(&config.code) };
-  let res = compile_attr(code, &config)?;
-  let serializer = Serializer::new().serialize_maps_as_objects(true);
-  res.serialize(&serializer).map_err(JsValue::from)
-}
-
-// ---------------------------------------------
-
-#[cfg(not(target_arch = "wasm32"))]
 use napi::{CallContext, Env, JsObject, JsUnknown};
-#[cfg(not(target_arch = "wasm32"))]
 use napi_derive::{js_function, module_exports};
 
 #[derive(Serialize)]
@@ -67,7 +42,6 @@ struct TransformResult<'i> {
   warnings: Vec<Warning<'i>>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl<'i> TransformResult<'i> {
   fn into_js(self, env: Env) -> napi::Result<JsUnknown> {
     // Manually construct buffers so we avoid a copy and work around
@@ -92,13 +66,20 @@ impl<'i> TransformResult<'i> {
   }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[js_function(1)]
 fn transform(ctx: CallContext) -> napi::Result<JsUnknown> {
+  use transformer::JsVisitor;
+
   let opts = ctx.get::<JsObject>(0)?;
+  let mut visitor = if let Ok(visitor) = opts.get_named_property::<JsObject>("visitor") {
+    Some(JsVisitor::new(*ctx.env, visitor))
+  } else {
+    None
+  };
+
   let config: Config = ctx.env.from_js_value(opts)?;
   let code = unsafe { std::str::from_utf8_unchecked(&config.code) };
-  let res = compile(code, &config);
+  let res = compile(code, &config, &mut visitor);
 
   match res {
     Ok(res) => res.into_js(*ctx.env),
@@ -106,13 +87,20 @@ fn transform(ctx: CallContext) -> napi::Result<JsUnknown> {
   }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[js_function(1)]
 fn transform_style_attribute(ctx: CallContext) -> napi::Result<JsUnknown> {
+  use transformer::JsVisitor;
+
   let opts = ctx.get::<JsObject>(0)?;
+  let mut visitor = if let Ok(visitor) = opts.get_named_property::<JsObject>("visitor") {
+    Some(JsVisitor::new(*ctx.env, visitor))
+  } else {
+    None
+  };
+
   let config: AttrConfig = ctx.env.from_js_value(opts)?;
   let code = unsafe { std::str::from_utf8_unchecked(&config.code) };
-  let res = compile_attr(code, &config);
+  let res = compile_attr(code, &config, &mut visitor);
 
   match res {
     Ok(res) => res.into_js(ctx),
@@ -129,10 +117,32 @@ mod bundle {
 
   #[js_function(1)]
   pub fn bundle(ctx: CallContext) -> napi::Result<JsUnknown> {
+    use transformer::JsVisitor;
+
     let opts = ctx.get::<JsObject>(0)?;
+    let mut visitor = if let Ok(visitor) = opts.get_named_property::<JsObject>("visitor") {
+      Some(JsVisitor::new(*ctx.env, visitor))
+    } else {
+      None
+    };
+
     let config: BundleConfig = ctx.env.from_js_value(opts)?;
     let fs = FileProvider::new();
-    let res = compile_bundle(&fs, &config);
+
+    // This is pretty silly, but works around a rust limitation that you cannot
+    // explicitly annotate lifetime bounds on closures.
+    fn annotate<'i, 'o, F>(f: F) -> F
+    where
+      F: FnOnce(&mut StyleSheet<'i, 'o, AtRule<'i>>) -> napi::Result<()>,
+    {
+      f
+    }
+
+    let res = compile_bundle(
+      &fs,
+      &config,
+      visitor.as_mut().map(|visitor| annotate(|stylesheet| stylesheet.visit(visitor))),
+    );
 
     match res {
       Ok(res) => res.into_js(*ctx.env),
@@ -241,6 +251,11 @@ mod bundle {
     tx: Sender<napi::Result<String>>,
   }
 
+  struct VisitMessage {
+    stylesheet: &'static mut StyleSheet<'static, 'static, AtRule<'static>>,
+    tx: Sender<napi::Result<String>>,
+  }
+
   fn await_promise(env: Env, result: JsUnknown, tx: Sender<napi::Result<String>>) -> napi::Result<()> {
     // If the result is a promise, wait for it to resolve, and send the result to the channel.
     // Otherwise, send the result immediately.
@@ -273,7 +288,7 @@ mod bundle {
   fn resolve_on_js_thread(ctx: ThreadSafeCallContext<ResolveMessage>) -> napi::Result<()> {
     let specifier = ctx.env.create_string(&ctx.value.specifier)?;
     let originating_file = ctx.env.create_string(&ctx.value.originating_file)?;
-    let result = ctx.callback.call(None, &[specifier, originating_file])?;
+    let result = ctx.callback.unwrap().call(None, &[specifier, originating_file])?;
     await_promise(ctx.env, result, ctx.value.tx)
   }
 
@@ -294,7 +309,7 @@ mod bundle {
 
   fn read_on_js_thread(ctx: ThreadSafeCallContext<ReadMessage>) -> napi::Result<()> {
     let file = ctx.env.create_string(&ctx.value.file)?;
-    let result = ctx.callback.call(None, &[file])?;
+    let result = ctx.callback.unwrap().call(None, &[file])?;
     await_promise(ctx.env, result, ctx.value.tx)
   }
 
@@ -303,10 +318,18 @@ mod bundle {
     handle_error(tx, read_on_js_thread(ctx))
   }
 
-  #[cfg(not(target_arch = "wasm32"))]
   #[js_function(1)]
   pub fn bundle_async(ctx: CallContext) -> napi::Result<JsObject> {
+    use transformer::JsVisitor;
+
     let opts = ctx.get::<JsObject>(0)?;
+    let visitor = if let Ok(visitor) = opts.get_named_property::<JsObject>("visitor") {
+      let visitor = JsVisitor::new(*ctx.env, visitor);
+      Some(visitor)
+    } else {
+      None
+    };
+
     let config: BundleConfig = ctx.env.from_js_value(&opts)?;
 
     if let Ok(resolver) = opts.get_named_property::<JsObject>("resolver") {
@@ -340,10 +363,10 @@ mod bundle {
         inputs: Mutex::new(Vec::new()),
       };
 
-      run_bundle_task(provider, config, *ctx.env)
+      run_bundle_task(provider, config, visitor, *ctx.env)
     } else {
       let provider = FileProvider::new();
-      run_bundle_task(provider, config, *ctx.env)
+      run_bundle_task(provider, config, visitor, *ctx.env)
     }
   }
 
@@ -354,13 +377,55 @@ mod bundle {
   fn run_bundle_task<P: 'static + SourceProvider>(
     provider: P,
     config: BundleConfig,
+    visitor: Option<JsVisitor>,
     env: Env,
   ) -> napi::Result<JsObject> {
     let (deferred, promise) = env.create_deferred()?;
 
+    let tsfn = if let Some(mut visitor) = visitor {
+      Some(ThreadsafeFunction::create(
+        env.raw(),
+        std::ptr::null_mut(),
+        0,
+        move |ctx: ThreadSafeCallContext<VisitMessage>| {
+          if let Err(err) = ctx.value.stylesheet.visit(&mut visitor) {
+            ctx.value.tx.send(Err(err.clone())).expect("send error");
+            return Ok(());
+          }
+          ctx.value.tx.send(Ok(Default::default())).expect("send error");
+          Ok(())
+        },
+      )?)
+    } else {
+      None
+    };
+
     // Run bundling task in rayon threadpool.
     rayon::spawn(move || {
-      match compile_bundle(unsafe { std::mem::transmute::<&'_ P, &'static P>(&provider) }, &config) {
+      match compile_bundle(
+        unsafe { std::mem::transmute::<&'_ P, &'static P>(&provider) },
+        &config,
+        tsfn.map(move |tsfn| {
+          move |stylesheet: &mut StyleSheet<AtRule>| {
+            CHANNEL.with(|channel| {
+              let message = VisitMessage {
+                // SAFETY: we immediately lock the thread until we get a response,
+                // so stylesheet cannot be dropped in that time.
+                stylesheet: unsafe {
+                  std::mem::transmute::<
+                    &'_ mut StyleSheet<'_, '_, AtRule>,
+                    &'static mut StyleSheet<'static, 'static, AtRule>,
+                  >(stylesheet)
+                },
+                tx: channel.0.clone(),
+              };
+
+              tsfn.call(message, ThreadsafeFunctionCallMode::Blocking);
+              channel.1.recv().expect("recv error").map(|_| ())
+            })
+          }
+        }),
+      ) {
         Ok(v) => deferred.resolve(|env| v.into_js(env)),
         Err(err) => deferred.reject(err.into()),
       }
@@ -370,15 +435,51 @@ mod bundle {
   }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[module_exports]
+#[cfg_attr(not(target_arch = "wasm32"), module_exports)]
 fn init(mut exports: JsObject) -> napi::Result<()> {
   exports.create_named_method("transform", transform)?;
   exports.create_named_method("transformStyleAttribute", transform_style_attribute)?;
-  exports.create_named_method("bundle", bundle::bundle)?;
-  exports.create_named_method("bundleAsync", bundle::bundle_async)?;
+
+  #[cfg(not(target_arch = "wasm32"))]
+  {
+    exports.create_named_method("bundle", bundle::bundle)?;
+    exports.create_named_method("bundleAsync", bundle::bundle_async)?;
+  }
 
   Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub unsafe fn napi_register_wasm_v1(raw_env: napi::sys::napi_env, raw_exports: napi::sys::napi_value) {
+  use napi::{Env, JsObject, NapiValue};
+
+  let env = Env::from_raw(raw_env);
+  let exports = JsObject::from_raw_unchecked(raw_env, raw_exports);
+  init(exports);
+}
+
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub extern "C" fn napi_wasm_malloc(size: usize) -> *mut u8 {
+  use std::alloc::{alloc, Layout};
+  use std::mem;
+
+  let align = mem::align_of::<usize>();
+  if let Ok(layout) = Layout::from_size_align(size, align) {
+    unsafe {
+      if layout.size() > 0 {
+        let ptr = alloc(layout);
+        if !ptr.is_null() {
+          return ptr;
+        }
+      } else {
+        return align as *mut u8;
+      }
+    }
+  }
+
+  std::process::abort();
 }
 
 // ---------------------------------------------
@@ -387,6 +488,7 @@ fn init(mut exports: JsObject) -> napi::Result<()> {
 #[serde(rename_all = "camelCase")]
 struct Config {
   pub filename: Option<String>,
+  pub project_root: Option<String>,
   #[serde(with = "serde_bytes")]
   pub code: Vec<u8>,
   pub targets: Option<Browsers>,
@@ -394,11 +496,13 @@ struct Config {
   pub source_map: Option<bool>,
   pub input_source_map: Option<String>,
   pub drafts: Option<Drafts>,
+  pub non_standard: Option<NonStandard>,
   pub css_modules: Option<CssModulesOption>,
   pub analyze_dependencies: Option<AnalyzeDependenciesOption>,
   pub pseudo_classes: Option<OwnedPseudoClasses>,
   pub unused_symbols: Option<HashSet<String>>,
   pub error_recovery: Option<bool>,
+  pub custom_at_rules: Option<HashMap<String, CustomAtRuleConfig>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -432,15 +536,18 @@ struct CssModulesConfig {
 #[serde(rename_all = "camelCase")]
 struct BundleConfig {
   pub filename: String,
+  pub project_root: Option<String>,
   pub targets: Option<Browsers>,
   pub minify: Option<bool>,
   pub source_map: Option<bool>,
   pub drafts: Option<Drafts>,
+  pub non_standard: Option<NonStandard>,
   pub css_modules: Option<CssModulesOption>,
   pub analyze_dependencies: Option<AnalyzeDependenciesOption>,
   pub pseudo_classes: Option<OwnedPseudoClasses>,
   pub unused_symbols: Option<HashSet<String>>,
   pub error_recovery: Option<bool>,
+  pub custom_at_rules: Option<HashMap<String, CustomAtRuleConfig>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -474,13 +581,26 @@ struct Drafts {
   custom_media: bool,
 }
 
-fn compile<'i>(code: &'i str, config: &Config) -> Result<TransformResult<'i>, CompileError<'i, std::io::Error>> {
+#[derive(Serialize, Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NonStandard {
+  #[serde(default)]
+  deep_selector_combinator: bool,
+}
+
+fn compile<'i>(
+  code: &'i str,
+  config: &Config,
+  visitor: &mut Option<JsVisitor>,
+) -> Result<TransformResult<'i>, CompileError<'i, std::io::Error>> {
   let drafts = config.drafts.as_ref();
+  let non_standard = config.non_standard.as_ref();
   let warnings = Some(Arc::new(RwLock::new(Vec::new())));
 
   let filename = config.filename.clone().unwrap_or_default();
+  let project_root = config.project_root.as_ref().map(|p| p.as_ref());
   let mut source_map = if config.source_map.unwrap_or_default() {
-    let mut sm = SourceMap::new("/");
+    let mut sm = SourceMap::new(project_root.unwrap_or("/"));
     sm.add_source(&filename);
     sm.set_source_content(0, code)?;
     Some(sm)
@@ -489,12 +609,19 @@ fn compile<'i>(code: &'i str, config: &Config) -> Result<TransformResult<'i>, Co
   };
 
   let res = {
-    let mut stylesheet = StyleSheet::parse(
+    let mut flags = ParserFlags::empty();
+    flags.set(ParserFlags::NESTING, matches!(drafts, Some(d) if d.nesting));
+    flags.set(ParserFlags::CUSTOM_MEDIA, matches!(drafts, Some(d) if d.custom_media));
+    flags.set(
+      ParserFlags::DEEP_SELECTOR_COMBINATOR,
+      matches!(non_standard, Some(v) if v.deep_selector_combinator),
+    );
+
+    let mut stylesheet = StyleSheet::parse_with(
       &code,
       ParserOptions {
         filename: filename.clone(),
-        nesting: matches!(drafts, Some(d) if d.nesting),
-        custom_media: matches!(drafts, Some(d) if d.custom_media),
+        flags,
         css_modules: if let Some(css_modules) = &config.css_modules {
           match css_modules {
             CssModulesOption::Bool(true) => Some(lightningcss::css_modules::Config::default()),
@@ -517,9 +644,16 @@ fn compile<'i>(code: &'i str, config: &Config) -> Result<TransformResult<'i>, Co
         source_index: 0,
         error_recovery: config.error_recovery.unwrap_or_default(),
         warnings: warnings.clone(),
-        at_rule_parser: ParserOptions::default_at_rule_parser(),
+      },
+      &mut CustomAtRuleParser {
+        configs: config.custom_at_rules.clone().unwrap_or_default(),
       },
     )?;
+
+    if let Some(visitor) = visitor.as_mut() {
+      stylesheet.visit(visitor).map_err(CompileError::JsError)?;
+    }
+
     stylesheet.minify(MinifyOptions {
       targets: config.targets,
       unused_symbols: config.unused_symbols.clone().unwrap_or_default(),
@@ -528,6 +662,7 @@ fn compile<'i>(code: &'i str, config: &Config) -> Result<TransformResult<'i>, Co
     stylesheet.to_css(PrinterOptions {
       minify: config.minify.unwrap_or_default(),
       source_map: source_map.as_mut(),
+      project_root,
       targets: config.targets,
       analyze_dependencies: if let Some(d) = &config.analyze_dependencies {
         match d {
@@ -574,21 +709,37 @@ fn compile<'i>(code: &'i str, config: &Config) -> Result<TransformResult<'i>, Co
   })
 }
 
-fn compile_bundle<'i, P: SourceProvider>(
+fn compile_bundle<
+  'i,
+  'o,
+  P: SourceProvider,
+  F: FnOnce(&mut StyleSheet<'i, 'o, AtRule<'i>>) -> napi::Result<()>,
+>(
   fs: &'i P,
-  config: &BundleConfig,
+  config: &'o BundleConfig,
+  visit: Option<F>,
 ) -> Result<TransformResult<'i>, CompileError<'i, P::Error>> {
+  let project_root = config.project_root.as_ref().map(|p| p.as_ref());
   let mut source_map = if config.source_map.unwrap_or_default() {
-    Some(SourceMap::new("/"))
+    Some(SourceMap::new(project_root.unwrap_or("/")))
   } else {
     None
   };
   let warnings = Some(Arc::new(RwLock::new(Vec::new())));
+
   let res = {
     let drafts = config.drafts.as_ref();
+    let non_standard = config.non_standard.as_ref();
+    let mut flags = ParserFlags::empty();
+    flags.set(ParserFlags::NESTING, matches!(drafts, Some(d) if d.nesting));
+    flags.set(ParserFlags::CUSTOM_MEDIA, matches!(drafts, Some(d) if d.custom_media));
+    flags.set(
+      ParserFlags::DEEP_SELECTOR_COMBINATOR,
+      matches!(non_standard, Some(v) if v.deep_selector_combinator),
+    );
+
     let parser_options = ParserOptions {
-      nesting: matches!(drafts, Some(d) if d.nesting),
-      custom_media: matches!(drafts, Some(d) if d.custom_media),
+      flags,
       css_modules: if let Some(css_modules) = &config.css_modules {
         match css_modules {
           CssModulesOption::Bool(true) => Some(lightningcss::css_modules::Config::default()),
@@ -610,11 +761,21 @@ fn compile_bundle<'i, P: SourceProvider>(
       },
       error_recovery: config.error_recovery.unwrap_or_default(),
       warnings: warnings.clone(),
-      ..ParserOptions::default()
+      filename: String::new(),
+      source_index: 0,
     };
 
-    let mut bundler = Bundler::new(fs, source_map.as_mut(), parser_options);
+    let mut at_rule_parser = CustomAtRuleParser {
+      configs: config.custom_at_rules.clone().unwrap_or_default(),
+    };
+
+    let mut bundler =
+      Bundler::new_with_at_rule_parser(fs, source_map.as_mut(), parser_options, &mut at_rule_parser);
     let mut stylesheet = bundler.bundle(Path::new(&config.filename))?;
+
+    if let Some(visit) = visit {
+      visit(&mut stylesheet).map_err(CompileError::JsError)?;
+    }
 
     stylesheet.minify(MinifyOptions {
       targets: config.targets,
@@ -624,6 +785,7 @@ fn compile_bundle<'i, P: SourceProvider>(
     stylesheet.to_css(PrinterOptions {
       minify: config.minify.unwrap_or_default(),
       source_map: source_map.as_mut(),
+      project_root,
       targets: config.targets,
       analyze_dependencies: if let Some(d) = &config.analyze_dependencies {
         match d {
@@ -688,7 +850,6 @@ struct AttrResult<'i> {
   warnings: Vec<Warning<'i>>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl<'i> AttrResult<'i> {
   fn into_js(self, ctx: CallContext) -> napi::Result<JsUnknown> {
     // Manually construct buffers so we avoid a copy and work around
@@ -705,6 +866,7 @@ impl<'i> AttrResult<'i> {
 fn compile_attr<'i>(
   code: &'i str,
   config: &AttrConfig,
+  visitor: &mut Option<JsVisitor>,
 ) -> Result<AttrResult<'i>, CompileError<'i, std::io::Error>> {
   let warnings = if config.error_recovery {
     Some(Arc::new(RwLock::new(Vec::new())))
@@ -722,6 +884,11 @@ fn compile_attr<'i>(
         ..ParserOptions::default()
       },
     )?;
+
+    if let Some(visitor) = visitor.as_mut() {
+      attr.visit(visitor).unwrap();
+    }
+
     attr.minify(MinifyOptions {
       targets: config.targets,
       ..MinifyOptions::default()
@@ -729,6 +896,7 @@ fn compile_attr<'i>(
     attr.to_css(PrinterOptions {
       minify: config.minify,
       source_map: None,
+      project_root: None,
       targets: config.targets,
       analyze_dependencies: if config.analyze_dependencies {
         Some(DependencyOptions::default())
@@ -760,6 +928,7 @@ enum CompileError<'i, E: std::error::Error> {
   SourceMapError(parcel_sourcemap::SourceMapError),
   BundleError(Error<BundleErrorKind<'i, E>>),
   PatternError(PatternParseError),
+  JsError(napi::Error),
 }
 
 impl<'i, E: std::error::Error> std::fmt::Display for CompileError<'i, E> {
@@ -771,12 +940,12 @@ impl<'i, E: std::error::Error> std::fmt::Display for CompileError<'i, E> {
       CompileError::BundleError(err) => err.kind.fmt(f),
       CompileError::PatternError(err) => err.fmt(f),
       CompileError::SourceMapError(err) => write!(f, "{}", err.to_string()), // TODO: switch to `fmt::Display` once parcel_sourcemap supports this
+      CompileError::JsError(err) => std::fmt::Debug::fmt(&err, f),
     }
   }
 }
 
 impl<'i, E: std::error::Error> CompileError<'i, E> {
-  #[cfg(not(target_arch = "wasm32"))]
   fn throw(self, env: Env, code: Option<&str>) -> napi::Result<JsUnknown> {
     let reason = self.to_string();
     let data = match &self {
@@ -849,24 +1018,13 @@ impl<'i, E: std::error::Error> From<Error<BundleErrorKind<'i, E>>> for CompileEr
   }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl<'i, E: std::error::Error> From<CompileError<'i, E>> for napi::Error {
   fn from(e: CompileError<'i, E>) -> napi::Error {
     match e {
       CompileError::SourceMapError(e) => napi::Error::from_reason(e.to_string()),
       CompileError::PatternError(e) => napi::Error::from_reason(e.to_string()),
+      CompileError::JsError(e) => e,
       _ => napi::Error::new(napi::Status::GenericFailure, e.to_string()),
-    }
-  }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl<'i, E: std::error::Error> From<CompileError<'i, E>> for wasm_bindgen::JsValue {
-  fn from(e: CompileError<'i, E>) -> wasm_bindgen::JsValue {
-    match e {
-      CompileError::SourceMapError(e) => js_sys::Error::new(&e.to_string()).into(),
-      CompileError::PatternError(e) => js_sys::Error::new(&e.to_string()).into(),
-      _ => js_sys::Error::new(&e.to_string()).into(),
     }
   }
 }

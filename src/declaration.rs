@@ -34,6 +34,7 @@ use crate::properties::{Property, PropertyId};
 use crate::targets::Browsers;
 use crate::traits::{PropertyHandler, ToCss};
 use crate::values::string::CowArcStr;
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 
@@ -42,21 +43,29 @@ use cssparser::*;
 /// Properties are separated into a list of `!important` declararations,
 /// and a list of normal declarations. This reduces memory usage compared
 /// with storing a boolean along with each property.
-#[derive(Debug, PartialEq, Clone, Visit)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, PartialEq, Clone, Default)]
+#[cfg_attr(feature = "visitor", derive(Visit), visit(visit_declaration_block, PROPERTIES))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct DeclarationBlock<'i> {
   /// A list of `!important` declarations in the block.
-  #[cfg_attr(feature = "serde", serde(borrow))]
+  #[cfg_attr(feature = "serde", serde(borrow, default))]
   pub important_declarations: Vec<Property<'i>>,
   /// A list of normal declarations in the block.
+  #[cfg_attr(feature = "serde", serde(default))]
   pub declarations: Vec<Property<'i>>,
 }
 
 impl<'i> DeclarationBlock<'i> {
   /// Parses a declaration block from CSS syntax.
-  pub fn parse<'a, 'o, 't, T>(
+  pub fn parse<'a, 'o, 't>(
     input: &mut Parser<'i, 't>,
-    options: &'a ParserOptions<'o, 'i, T>,
+    options: &'a ParserOptions<'o, 'i>,
   ) -> Result<Self, ParseError<'i, ParserError<'i>>> {
     let mut important_declarations = DeclarationList::new();
     let mut declarations = DeclarationList::new();
@@ -85,9 +94,9 @@ impl<'i> DeclarationBlock<'i> {
   }
 
   /// Parses a declaration block from a string.
-  pub fn parse_string<'o, T>(
+  pub fn parse_string<'o>(
     input: &'i str,
-    options: ParserOptions<'o, 'i, T>,
+    options: ParserOptions<'o, 'i>,
   ) -> Result<Self, ParseError<'i, ParserError<'i>>> {
     let mut input = ParserInput::new(input);
     let mut parser = Parser::new(&mut input);
@@ -394,14 +403,14 @@ impl<'i> DeclarationBlock<'i> {
   }
 }
 
-struct PropertyDeclarationParser<'a, 'o, 'i, T> {
+struct PropertyDeclarationParser<'a, 'o, 'i> {
   important_declarations: &'a mut Vec<Property<'i>>,
   declarations: &'a mut Vec<Property<'i>>,
-  options: &'a ParserOptions<'o, 'i, T>,
+  options: &'a ParserOptions<'o, 'i>,
 }
 
 /// Parse a declaration within {} block: `color: blue`
-impl<'a, 'o, 'i, T> cssparser::DeclarationParser<'i> for PropertyDeclarationParser<'a, 'o, 'i, T> {
+impl<'a, 'o, 'i> cssparser::DeclarationParser<'i> for PropertyDeclarationParser<'a, 'o, 'i> {
   type Declaration = ();
   type Error = ParserError<'i>;
 
@@ -421,18 +430,18 @@ impl<'a, 'o, 'i, T> cssparser::DeclarationParser<'i> for PropertyDeclarationPars
 }
 
 /// Default methods reject all at rules.
-impl<'a, 'o, 'i, T> AtRuleParser<'i> for PropertyDeclarationParser<'a, 'o, 'i, T> {
+impl<'a, 'o, 'i> AtRuleParser<'i> for PropertyDeclarationParser<'a, 'o, 'i> {
   type Prelude = ();
   type AtRule = ();
   type Error = ParserError<'i>;
 }
 
-pub(crate) fn parse_declaration<'i, 't, T>(
+pub(crate) fn parse_declaration<'i, 't>(
   name: CowRcStr<'i>,
   input: &mut cssparser::Parser<'i, 't>,
   declarations: &mut DeclarationList<'i>,
   important_declarations: &mut DeclarationList<'i>,
-  options: &ParserOptions<T>,
+  options: &ParserOptions<'_, 'i>,
 ) -> Result<(), cssparser::ParseError<'i, ParserError<'i>>> {
   let property = input.parse_until_before(Delimiter::Bang, |input| {
     Property::parse(PropertyId::from(CowArcStr::from(name)), input, options)
@@ -488,7 +497,7 @@ impl<'i> DeclarationHandler<'i> {
     DeclarationHandler {
       background: BackgroundHandler::new(targets),
       border: BorderHandler::new(targets),
-      outline: OutlineHandler::new(targets),
+      outline: OutlineHandler::default(),
       flex: FlexHandler::new(targets),
       grid: GridHandler::default(),
       align: AlignHandler::new(targets),
@@ -499,7 +508,7 @@ impl<'i> DeclarationHandler<'i> {
       scroll_padding: ScrollPaddingHandler::default(),
       font: FontHandler::default(),
       text: TextDecorationHandler::new(targets),
-      list: ListStyleHandler::new(targets),
+      list: ListStyleHandler::default(),
       transition: TransitionHandler::new(targets),
       animation: AnimationHandler::new(targets),
       display: DisplayHandler::new(targets),
@@ -510,8 +519,8 @@ impl<'i> DeclarationHandler<'i> {
       box_shadow: BoxShadowHandler::new(targets),
       mask: MaskHandler::default(),
       container: ContainerHandler::default(),
-      fallback: FallbackHandler::new(targets),
-      prefix: PrefixHandler::new(targets),
+      fallback: FallbackHandler::default(),
+      prefix: PrefixHandler::default(),
       decls: DeclarationList::new(),
     }
   }

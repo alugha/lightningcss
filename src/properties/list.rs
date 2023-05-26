@@ -7,19 +7,23 @@ use crate::error::{ParserError, PrinterError};
 use crate::macros::{define_shorthand, enum_property, shorthand_handler, shorthand_property};
 use crate::printer::Printer;
 use crate::targets::Browsers;
-use crate::traits::{FallbackValues, Parse, PropertyHandler, Shorthand, ToCss};
+use crate::traits::{FallbackValues, IsCompatible, Parse, PropertyHandler, Shorthand, ToCss};
 use crate::values::string::CSSString;
 use crate::values::{ident::CustomIdent, image::Image};
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 
 /// A value for the [list-style-type](https://www.w3.org/TR/2020/WD-css-lists-3-20201117/#text-markers) property.
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
   serde(tag = "type", content = "value", rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum ListStyleType<'i> {
   /// No marker.
   None,
@@ -64,26 +68,85 @@ impl ToCss for ListStyleType<'_> {
   }
 }
 
+impl IsCompatible for ListStyleType<'_> {
+  fn is_compatible(&self, browsers: Browsers) -> bool {
+    match self {
+      ListStyleType::CounterStyle(c) => c.is_compatible(browsers),
+      ListStyleType::String(..) => crate::compat::Feature::StringListStyleType.is_compatible(browsers),
+      ListStyleType::None => true,
+    }
+  }
+}
+
 /// A [counter-style](https://www.w3.org/TR/css-counter-styles-3/#typedef-counter-style) name.
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
-  serde(tag = "type", content = "value", rename_all = "kebab-case")
+  serde(tag = "type", rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum CounterStyle<'i> {
   /// A predefined counter style name.
+  #[cfg_attr(
+    feature = "serde",
+    serde(with = "crate::serialization::ValueWrapper::<PredefinedCounterStyle>")
+  )]
   Predefined(PredefinedCounterStyle),
   /// A custom counter style name.
+  #[cfg_attr(
+    feature = "serde",
+    serde(borrow, with = "crate::serialization::ValueWrapper::<CustomIdent>")
+  )]
   Name(CustomIdent<'i>),
   /// An inline [`symbols()`](https://www.w3.org/TR/css-counter-styles-3/#symbols-function) definition.
-  Symbols(
-    SymbolsType,
-    #[cfg_attr(feature = "serde", serde(borrow))] Vec<Symbol<'i>>,
-  ),
+  Symbols {
+    /// The counter system.
+    #[cfg_attr(feature = "serde", serde(default))]
+    system: SymbolsType,
+    /// The symbols.
+    symbols: Vec<Symbol<'i>>,
+  },
 }
 
-enum_property! {
+macro_rules! counter_styles {
+  (
+    $(#[$outer:meta])*
+    $vis:vis enum $name:ident {
+      $(
+        $(#[$meta: meta])*
+        $str: literal: $id: ident,
+      )+
+    }
+  ) => {
+    enum_property! {
+      /// A [predefined counter](https://www.w3.org/TR/css-counter-styles-3/#predefined-counters) style.
+      #[allow(missing_docs)]
+      pub enum PredefinedCounterStyle {
+        $(
+           $(#[$meta])*
+           $str: $id,
+        )+
+      }
+    }
+
+    impl IsCompatible for PredefinedCounterStyle {
+      fn is_compatible(&self, browsers: Browsers) -> bool {
+        match self {
+          $(
+            PredefinedCounterStyle::$id => paste::paste! {
+              crate::compat::Feature::[<$id ListStyleType>].is_compatible(browsers)
+            },
+          )+
+        }
+      }
+    }
+  };
+}
+
+counter_styles! {
   /// A [predefined counter](https://www.w3.org/TR/css-counter-styles-3/#predefined-counters) style.
   #[allow(missing_docs)]
   pub enum PredefinedCounterStyle {
@@ -161,14 +224,14 @@ impl<'i> Parse<'i> for CounterStyle<'i> {
 
     if input.try_parse(|input| input.expect_function_matching("symbols")).is_ok() {
       return input.parse_nested_block(|input| {
-        let t = input.try_parse(SymbolsType::parse).unwrap_or(SymbolsType::Symbolic);
+        let t = input.try_parse(SymbolsType::parse).unwrap_or_default();
 
         let mut symbols = Vec::new();
         while let Ok(s) = input.try_parse(Symbol::parse) {
           symbols.push(s);
         }
 
-        Ok(CounterStyle::Symbols(t, symbols))
+        Ok(CounterStyle::Symbols { system: t, symbols })
       });
     }
 
@@ -190,7 +253,7 @@ impl ToCss for CounterStyle<'_> {
         }
         name.to_css(dest)
       }
-      CounterStyle::Symbols(t, symbols) => {
+      CounterStyle::Symbols { system: t, symbols } => {
         dest.write_str("symbols(")?;
         let mut needs_space = false;
         if *t != SymbolsType::Symbolic {
@@ -211,6 +274,16 @@ impl ToCss for CounterStyle<'_> {
   }
 }
 
+impl IsCompatible for CounterStyle<'_> {
+  fn is_compatible(&self, browsers: Browsers) -> bool {
+    match self {
+      CounterStyle::Name(..) => true,
+      CounterStyle::Predefined(p) => p.is_compatible(browsers),
+      CounterStyle::Symbols { .. } => crate::compat::Feature::SymbolsListStyleType.is_compatible(browsers),
+    }
+  }
+}
+
 enum_property! {
   /// A [`<symbols-type>`](https://www.w3.org/TR/css-counter-styles-3/#typedef-symbols-type) value,
   /// as used in the `symbols()` function.
@@ -226,16 +299,25 @@ enum_property! {
   }
 }
 
+impl Default for SymbolsType {
+  fn default() -> Self {
+    SymbolsType::Symbolic
+  }
+}
+
 /// A single [symbol](https://www.w3.org/TR/css-counter-styles-3/#funcdef-symbols) as used in the
 /// `symbols()` function.
 ///
 /// See [CounterStyle](CounterStyle).
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
   serde(tag = "type", content = "value", rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum Symbol<'i> {
   /// A string.
   #[cfg_attr(feature = "serde", serde(borrow))]
@@ -283,6 +365,12 @@ impl Default for ListStylePosition {
   }
 }
 
+impl IsCompatible for ListStylePosition {
+  fn is_compatible(&self, _browsers: Browsers) -> bool {
+    true
+  }
+}
+
 enum_property! {
   /// A value for the [marker-side](https://www.w3.org/TR/2020/WD-css-lists-3-20201117/#marker-side) property.
   #[allow(missing_docs)]
@@ -294,6 +382,7 @@ enum_property! {
 
 shorthand_property! {
   /// A value for the [list-style](https://www.w3.org/TR/2020/WD-css-lists-3-20201117/#list-style-property) shorthand property.
+  #[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
   pub struct ListStyle<'i> {
     /// The list style type.
     #[cfg_attr(feature = "serde", serde(borrow))]

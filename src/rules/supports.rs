@@ -5,15 +5,23 @@ use super::{CssRuleList, MinifyContext};
 use crate::error::{MinifyError, ParserError, PrinterError};
 use crate::parser::DefaultAtRule;
 use crate::printer::Printer;
-use crate::rules::{StyleContext, ToCssWithContext};
+use crate::properties::PropertyId;
+use crate::targets::Browsers;
 use crate::traits::{Parse, ToCss};
 use crate::values::string::CowArcStr;
+use crate::vendor_prefix::VendorPrefix;
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 
+#[cfg(feature = "serde")]
+use crate::serialization::ValueWrapper;
+
 /// A [@supports](https://drafts.csswg.org/css-conditional-3/#at-supports) rule.
-#[derive(Debug, PartialEq, Clone, Visit)]
+#[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct SupportsRule<'i, R = DefaultAtRule> {
   /// The supports condition.
   #[cfg_attr(feature = "serde", serde(borrow))]
@@ -21,7 +29,7 @@ pub struct SupportsRule<'i, R = DefaultAtRule> {
   /// The rules within the `@supports` rule.
   pub rules: CssRuleList<'i, R>,
   /// The location of the rule in the source file.
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub loc: Location,
 }
 
@@ -31,19 +39,20 @@ impl<'i, T> SupportsRule<'i, T> {
     context: &mut MinifyContext<'_, 'i>,
     parent_is_unused: bool,
   ) -> Result<(), MinifyError> {
+    if let Some(targets) = context.targets {
+      self.condition.set_prefixes_for_targets(targets)
+    }
+
     self.rules.minify(context, parent_is_unused)
   }
 }
 
-impl<'a, 'i, T: ToCss> ToCssWithContext<'a, 'i, T> for SupportsRule<'i, T> {
-  fn to_css_with_context<W>(
-    &self,
-    dest: &mut Printer<W>,
-    context: Option<&StyleContext<'a, 'i, T>>,
-  ) -> Result<(), PrinterError>
+impl<'a, 'i, T: ToCss> ToCss for SupportsRule<'i, T> {
+  fn to_css<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError>
   where
     W: std::fmt::Write,
   {
+    #[cfg(feature = "sourcemap")]
     dest.add_mapping(self.loc);
     dest.write_str("@supports ")?;
     self.condition.to_css(dest)?;
@@ -51,7 +60,7 @@ impl<'a, 'i, T: ToCss> ToCssWithContext<'a, 'i, T> for SupportsRule<'i, T> {
     dest.write_char('{')?;
     dest.indent();
     dest.newline()?;
-    self.rules.to_css_with_context(dest, context)?;
+    self.rules.to_css(dest)?;
     dest.dedent();
     dest.newline()?;
     dest.write_char('}')
@@ -60,33 +69,43 @@ impl<'a, 'i, T: ToCss> ToCssWithContext<'a, 'i, T> for SupportsRule<'i, T> {
 
 /// A [`<supports-condition>`](https://drafts.csswg.org/css-conditional-3/#typedef-supports-condition),
 /// as used in the `@supports` and `@import` rules.
-#[derive(Debug, PartialEq, Clone, Visit)]
-#[visit(visit_supports_condition, SUPPORTS_CONDITIONS)]
+#[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
+#[cfg_attr(feature = "visitor", visit(visit_supports_condition, SUPPORTS_CONDITIONS))]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
-  serde(tag = "type", content = "value", rename_all = "kebab-case")
+  serde(tag = "type", rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum SupportsCondition<'i> {
   /// A `not` expression.
-  #[skip_type]
+  #[cfg_attr(feature = "visitor", skip_type)]
+  #[cfg_attr(feature = "serde", serde(with = "ValueWrapper::<Box<SupportsCondition>>"))]
   Not(Box<SupportsCondition<'i>>),
   /// An `and` expression.
-  #[skip_type]
+  #[cfg_attr(feature = "visitor", skip_type)]
+  #[cfg_attr(feature = "serde", serde(with = "ValueWrapper::<Vec<SupportsCondition>>"))]
   And(Vec<SupportsCondition<'i>>),
   /// An `or` expression.
-  #[skip_type]
+  #[cfg_attr(feature = "visitor", skip_type)]
+  #[cfg_attr(feature = "serde", serde(with = "ValueWrapper::<Vec<SupportsCondition>>"))]
   Or(Vec<SupportsCondition<'i>>),
   /// A declaration to evaluate.
-  #[cfg_attr(feature = "serde", serde(borrow))]
-  Declaration(CowArcStr<'i>),
+  Declaration {
+    /// The property id for the declaration.
+    #[cfg_attr(feature = "serde", serde(borrow, rename = "propertyId"))]
+    property_id: PropertyId<'i>,
+    /// The raw value of the declaration.
+    value: CowArcStr<'i>,
+  },
   /// A selector to evaluate.
+  #[cfg_attr(feature = "serde", serde(with = "ValueWrapper::<CowArcStr>"))]
   Selector(CowArcStr<'i>),
   // FontTechnology()
-  /// A parenthesized expression.
-  #[skip_type]
-  Parens(Box<SupportsCondition<'i>>),
   /// An unknown condition.
+  #[cfg_attr(feature = "serde", serde(with = "ValueWrapper::<CowArcStr>"))]
   Unknown(CowArcStr<'i>),
 }
 
@@ -98,7 +117,7 @@ impl<'i> SupportsCondition<'i> {
         a.push(b.clone());
       }
     } else if self != b {
-      *self = SupportsCondition::Parens(Box::new(SupportsCondition::And(vec![self.clone(), b.clone()])))
+      *self = SupportsCondition::And(vec![self.clone(), b.clone()])
     }
   }
 
@@ -109,7 +128,25 @@ impl<'i> SupportsCondition<'i> {
         a.push(b.clone());
       }
     } else if self != b {
-      *self = SupportsCondition::Parens(Box::new(SupportsCondition::Or(vec![self.clone(), b.clone()])))
+      *self = SupportsCondition::Or(vec![self.clone(), b.clone()])
+    }
+  }
+
+  fn set_prefixes_for_targets(&mut self, targets: &Browsers) {
+    match self {
+      SupportsCondition::Not(cond) => cond.set_prefixes_for_targets(targets),
+      SupportsCondition::And(items) | SupportsCondition::Or(items) => {
+        for item in items {
+          item.set_prefixes_for_targets(targets);
+        }
+      }
+      SupportsCondition::Declaration { property_id, .. } => {
+        let prefix = property_id.prefix();
+        if prefix.is_empty() || prefix.contains(VendorPrefix::None) {
+          property_id.set_prefixes_for_targets(*targets);
+        }
+      }
+      _ => {}
     }
   }
 }
@@ -193,7 +230,7 @@ impl<'i> SupportsCondition<'i> {
         let res = input.try_parse(|input| {
           input.parse_nested_block(|input| {
             if let Ok(condition) = input.try_parse(SupportsCondition::parse) {
-              return Ok(SupportsCondition::Parens(Box::new(condition)));
+              return Ok(condition);
             }
 
             Self::parse_declaration(input)
@@ -213,11 +250,38 @@ impl<'i> SupportsCondition<'i> {
   pub(crate) fn parse_declaration<'t>(
     input: &mut Parser<'i, 't>,
   ) -> Result<Self, ParseError<'i, ParserError<'i>>> {
-    let pos = input.position();
-    input.expect_ident()?;
+    let property_id = PropertyId::parse(input)?;
     input.expect_colon()?;
+    input.skip_whitespace();
+    let pos = input.position();
     input.expect_no_error_token()?;
-    Ok(SupportsCondition::Declaration(input.slice_from(pos).into()))
+    Ok(SupportsCondition::Declaration {
+      property_id,
+      value: input.slice_from(pos).into(),
+    })
+  }
+
+  fn needs_parens(&self, parent: &SupportsCondition) -> bool {
+    match self {
+      SupportsCondition::Not(_) => true,
+      SupportsCondition::And(_) => !matches!(parent, SupportsCondition::And(_)),
+      SupportsCondition::Or(_) => !matches!(parent, SupportsCondition::Or(_)),
+      _ => false,
+    }
+  }
+
+  fn to_css_with_parens_if_needed<W>(&self, dest: &mut Printer<W>, needs_parens: bool) -> Result<(), PrinterError>
+  where
+    W: std::fmt::Write,
+  {
+    if needs_parens {
+      dest.write_char('(')?;
+    }
+    self.to_css(dest)?;
+    if needs_parens {
+      dest.write_char(')')?;
+    }
+    Ok(())
   }
 }
 
@@ -229,7 +293,7 @@ impl<'i> ToCss for SupportsCondition<'i> {
     match self {
       SupportsCondition::Not(condition) => {
         dest.write_str("not ")?;
-        condition.to_css(dest)
+        condition.to_css_with_parens_if_needed(dest, condition.needs_parens(self))
       }
       SupportsCondition::And(conditions) => {
         let mut first = true;
@@ -239,7 +303,7 @@ impl<'i> ToCss for SupportsCondition<'i> {
           } else {
             dest.write_str(" and ")?;
           }
-          condition.to_css(dest)?;
+          condition.to_css_with_parens_if_needed(dest, condition.needs_parens(self))?;
         }
         Ok(())
       }
@@ -251,18 +315,37 @@ impl<'i> ToCss for SupportsCondition<'i> {
           } else {
             dest.write_str(" or ")?;
           }
-          condition.to_css(dest)?;
+          condition.to_css_with_parens_if_needed(dest, condition.needs_parens(self))?;
         }
         Ok(())
       }
-      SupportsCondition::Parens(condition) => {
+      SupportsCondition::Declaration { property_id, value } => {
         dest.write_char('(')?;
-        condition.to_css(dest)?;
-        dest.write_char(')')
-      }
-      SupportsCondition::Declaration(decl) => {
-        dest.write_char('(')?;
-        dest.write_str(&decl)?;
+
+        let prefix = property_id.prefix().or_none();
+        if prefix != VendorPrefix::None {
+          dest.write_char('(')?;
+        }
+
+        let name = property_id.name();
+        let mut first = true;
+        for p in prefix {
+          if first {
+            first = false;
+          } else {
+            dest.write_str(") or (")?;
+          }
+
+          p.to_css(dest)?;
+          serialize_name(name, dest)?;
+          dest.delim(':', false)?;
+          dest.write_str(value)?;
+        }
+
+        if prefix != VendorPrefix::None {
+          dest.write_char(')')?;
+        }
+
         dest.write_char(')')
       }
       SupportsCondition::Selector(sel) => {

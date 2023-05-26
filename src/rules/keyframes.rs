@@ -17,12 +17,20 @@ use crate::values::ident::CustomIdent;
 use crate::values::percentage::Percentage;
 use crate::values::string::CowArcStr;
 use crate::vendor_prefix::VendorPrefix;
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 
 /// A [@keyframes](https://drafts.csswg.org/css-animations/#keyframes) rule.
-#[derive(Debug, PartialEq, Clone, Visit)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct KeyframesRule<'i> {
   /// The animation name.
   /// <keyframes-name> = <custom-ident> | <string>
@@ -31,16 +39,23 @@ pub struct KeyframesRule<'i> {
   /// A list of keyframes in the animation.
   pub keyframes: Vec<Keyframe<'i>>,
   /// A vendor prefix for the rule, e.g. `@-webkit-keyframes`.
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub vendor_prefix: VendorPrefix,
   /// The location of the rule in the source file.
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub loc: Location,
 }
 
 /// KeyframesName
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Visit)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(tag = "type", content = "value", rename_all = "kebab-case")
+)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum KeyframesName<'i> {
   /// `<custom-ident>` of a `@keyframes` name.
   #[cfg_attr(feature = "serde", serde(borrow))]
@@ -200,6 +215,7 @@ impl<'i> ToCss for KeyframesRule<'i> {
   where
     W: std::fmt::Write,
   {
+    #[cfg(feature = "sourcemap")]
     dest.add_mapping(self.loc);
     let mut first_rule = true;
     macro_rules! write_prefix {
@@ -248,12 +264,14 @@ impl<'i> ToCss for KeyframesRule<'i> {
 
 /// A [keyframe selector](https://drafts.csswg.org/css-animations/#typedef-keyframe-selector)
 /// within an `@keyframes` rule.
-#[derive(Debug, PartialEq, Clone, Visit)]
+#[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
   serde(tag = "type", content = "value", rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum KeyframeSelector {
   /// An explicit percentage.
   Percentage(Percentage),
@@ -309,8 +327,11 @@ impl ToCss for KeyframeSelector {
 /// An individual keyframe within an `@keyframes` rule.
 ///
 /// See [KeyframesRule](KeyframesRule).
-#[derive(Debug, PartialEq, Clone, Visit)]
+#[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct Keyframe<'i> {
   /// A list of keyframe selectors to associate with the declarations in this keyframe.
   pub selectors: Vec<KeyframeSelector>,

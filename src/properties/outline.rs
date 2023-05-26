@@ -8,18 +8,21 @@ use crate::error::{ParserError, PrinterError};
 use crate::macros::{impl_shorthand, shorthand_handler};
 use crate::printer::Printer;
 use crate::targets::Browsers;
-use crate::traits::{FallbackValues, Parse, PropertyHandler, Shorthand, ToCss};
+use crate::traits::{FallbackValues, IsCompatible, Parse, PropertyHandler, Shorthand, ToCss};
 use crate::values::color::CssColor;
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 
 /// A value for the [outline-style](https://drafts.csswg.org/css-ui/#outline-style) property.
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
   serde(tag = "type", content = "value", rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum OutlineStyle {
   /// The `auto` keyword.
   Auto,
@@ -53,6 +56,12 @@ impl ToCss for OutlineStyle {
 impl Default for OutlineStyle {
   fn default() -> OutlineStyle {
     OutlineStyle::LineStyle(LineStyle::None)
+  }
+}
+
+impl IsCompatible for OutlineStyle {
+  fn is_compatible(&self, _browsers: Browsers) -> bool {
+    true
   }
 }
 

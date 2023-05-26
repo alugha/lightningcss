@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, convert::Infallible};
 
 use cssparser::*;
 use lightningcss::{
@@ -8,9 +8,9 @@ use lightningcss::{
   properties::custom::{Token, TokenOrValue},
   rules::{style::StyleRule, CssRule, CssRuleList, Location},
   selector::{Component, Selector},
-  stylesheet::{ParserOptions, PrinterOptions, StyleSheet},
+  stylesheet::{ParserFlags, ParserOptions, PrinterOptions, StyleSheet},
   targets::Browsers,
-  traits::ToCss,
+  traits::{AtRuleParser, ToCss},
   values::{color::CssColor, length::LengthValue},
   vendor_prefix::VendorPrefix,
   visit_types,
@@ -21,26 +21,23 @@ fn main() {
   let args: Vec<String> = std::env::args().collect();
   let source = std::fs::read_to_string(&args[1]).unwrap();
   let opts = ParserOptions {
-    at_rule_parser: Some(TailwindAtRuleParser),
     filename: args[1].clone(),
-    nesting: true,
-    custom_media: false,
-    css_modules: None,
-    error_recovery: false,
-    warnings: None,
-    source_index: 0,
+    flags: ParserFlags::NESTING,
+    ..Default::default()
   };
 
-  let mut stylesheet = StyleSheet::parse(&source, opts).unwrap();
+  let mut stylesheet = StyleSheet::parse_with(&source, opts, &mut TailwindAtRuleParser).unwrap();
 
   println!("{:?}", stylesheet);
 
   let mut style_rules = HashMap::new();
-  stylesheet.visit(&mut StyleRuleCollector {
-    rules: &mut style_rules,
-  });
+  stylesheet
+    .visit(&mut StyleRuleCollector {
+      rules: &mut style_rules,
+    })
+    .unwrap();
   println!("{:?}", style_rules);
-  stylesheet.visit(&mut ApplyVisitor { rules: &style_rules });
+  stylesheet.visit(&mut ApplyVisitor { rules: &style_rules }).unwrap();
 
   let result = stylesheet
     .to_css(PrinterOptions {
@@ -94,13 +91,14 @@ enum AtRule {
 struct TailwindAtRuleParser;
 impl<'i> AtRuleParser<'i> for TailwindAtRuleParser {
   type Prelude = Prelude;
-  type Error = ();
+  type Error = Infallible;
   type AtRule = AtRule;
 
   fn parse_prelude<'t>(
     &mut self,
     name: CowRcStr<'i>,
     input: &mut Parser<'i, 't>,
+    _options: &ParserOptions<'_, 'i>,
   ) -> Result<Self::Prelude, ParseError<'i, Self::Error>> {
     match_ignore_ascii_case! {&*name,
       "tailwind" => {
@@ -133,7 +131,12 @@ impl<'i> AtRuleParser<'i> for TailwindAtRuleParser {
     }
   }
 
-  fn rule_without_block(&mut self, prelude: Self::Prelude, start: &ParserState) -> Result<Self::AtRule, ()> {
+  fn rule_without_block(
+    &mut self,
+    prelude: Self::Prelude,
+    start: &ParserState,
+    _options: &ParserOptions<'_, 'i>,
+  ) -> Result<Self::AtRule, ()> {
     let loc = start.source_location();
     match prelude {
       Prelude::Tailwind(directive) => Ok(AtRule::Tailwind(TailwindRule { directive, loc })),
@@ -147,9 +150,11 @@ struct StyleRuleCollector<'i, 'a> {
 }
 
 impl<'i, 'a> Visitor<'i, AtRule> for StyleRuleCollector<'i, 'a> {
+  type Error = Infallible;
+
   const TYPES: VisitTypes = VisitTypes::RULES;
 
-  fn visit_rule(&mut self, rule: &mut lightningcss::rules::CssRule<'i, AtRule>) {
+  fn visit_rule(&mut self, rule: &mut lightningcss::rules::CssRule<'i, AtRule>) -> Result<(), Self::Error> {
     match rule {
       CssRule::Style(rule) => {
         for selector in rule.selectors.0.iter() {
@@ -178,14 +183,18 @@ struct ApplyVisitor<'a, 'i> {
 }
 
 impl<'a, 'i> Visitor<'i, AtRule> for ApplyVisitor<'a, 'i> {
+  type Error = Infallible;
+
   const TYPES: VisitTypes = visit_types!(RULES | COLORS | LENGTHS | DASHED_IDENTS | SELECTORS | TOKENS);
 
-  fn visit_rule(&mut self, rule: &mut CssRule<'i, AtRule>) {
+  fn visit_rule(&mut self, rule: &mut CssRule<'i, AtRule>) -> Result<(), Self::Error> {
     // Replace @apply rule with nested style rule.
     if let CssRule::Custom(AtRule::Apply(apply)) = rule {
       let mut declarations = DeclarationBlock::new();
       for name in &apply.names {
-        let applied = self.rules.get(name).unwrap();
+        let Some(applied) = self.rules.get(name) else {
+          continue;
+        };
         declarations
           .important_declarations
           .extend(applied.important_declarations.iter().cloned());
@@ -207,26 +216,34 @@ impl<'a, 'i> Visitor<'i, AtRule> for ApplyVisitor<'a, 'i> {
     rule.visit_children(self)
   }
 
-  fn visit_url(&mut self, url: &mut lightningcss::values::url::Url<'i>) {
-    url.url = format!("https://mywebsite.com/{}", url.url).into()
+  fn visit_url(&mut self, url: &mut lightningcss::values::url::Url<'i>) -> Result<(), Self::Error> {
+    url.url = format!("https://mywebsite.com/{}", url.url).into();
+    Ok(())
   }
 
-  fn visit_color(&mut self, color: &mut lightningcss::values::color::CssColor) {
-    *color = color.to_lab()
+  fn visit_color(&mut self, color: &mut lightningcss::values::color::CssColor) -> Result<(), Self::Error> {
+    *color = color.to_lab();
+    Ok(())
   }
 
-  fn visit_length(&mut self, length: &mut lightningcss::values::length::LengthValue) {
+  fn visit_length(&mut self, length: &mut lightningcss::values::length::LengthValue) -> Result<(), Self::Error> {
     match length {
       LengthValue::Px(px) => *length = LengthValue::Rem(*px / 16.0),
       _ => {}
     }
+
+    Ok(())
   }
 
-  fn visit_dashed_ident(&mut self, ident: &mut lightningcss::values::ident::DashedIdent) {
-    ident.0 = format!("--tw-{}", &ident.0[2..]).into()
+  fn visit_dashed_ident(
+    &mut self,
+    ident: &mut lightningcss::values::ident::DashedIdent,
+  ) -> Result<(), Self::Error> {
+    ident.0 = format!("--tw-{}", &ident.0[2..]).into();
+    Ok(())
   }
 
-  fn visit_selector(&mut self, selector: &mut Selector<'i>) {
+  fn visit_selector(&mut self, selector: &mut Selector<'i>) -> Result<(), Self::Error> {
     for c in selector.iter_mut_raw_match_order() {
       match c {
         Component::Class(c) => {
@@ -235,9 +252,11 @@ impl<'a, 'i> Visitor<'i, AtRule> for ApplyVisitor<'a, 'i> {
         _ => {}
       }
     }
+
+    Ok(())
   }
 
-  fn visit_token(&mut self, token: &mut TokenOrValue<'i>) {
+  fn visit_token(&mut self, token: &mut TokenOrValue<'i>) -> Result<(), Self::Error> {
     match token {
       TokenOrValue::Function(f) if f.name == "theme" => match f.arguments.0.first() {
         Some(TokenOrValue::Token(Token::String(s))) => match s.as_ref() {
@@ -254,10 +273,13 @@ impl<'a, 'i> Visitor<'i, AtRule> for ApplyVisitor<'a, 'i> {
   }
 }
 
+#[cfg(feature = "visitor")]
 impl<'i, V: Visitor<'i, AtRule>> Visit<'i, AtRule, V> for AtRule {
   const CHILD_TYPES: VisitTypes = VisitTypes::empty();
 
-  fn visit_children(&mut self, _: &mut V) {}
+  fn visit_children(&mut self, _: &mut V) -> Result<(), V::Error> {
+    Ok(())
+  }
 }
 
 impl ToCss for AtRule {

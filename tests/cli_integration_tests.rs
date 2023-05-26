@@ -5,6 +5,7 @@ use indoc::indoc;
 use lightningcss::css_modules::CssModuleExport;
 use predicates::prelude::*;
 use std::collections::HashMap;
+use std::fs;
 use std::process::Command;
 
 fn test_file() -> Result<assert_fs::NamedTempFile, FixtureError> {
@@ -13,6 +14,18 @@ fn test_file() -> Result<assert_fs::NamedTempFile, FixtureError> {
     r#"
       .foo {
         border: none;
+      }
+    "#,
+  )?;
+  Ok(file)
+}
+
+fn test_file2() -> Result<assert_fs::NamedTempFile, FixtureError> {
+  let file = assert_fs::NamedTempFile::new("test2.css")?;
+  file.write_str(
+    r#"
+      .foo {
+        color: yellow;
       }
     "#,
   )?;
@@ -67,7 +80,7 @@ fn css_module_test_vals() -> (String, String, String) {
       .foo {
         color: red;
       }
-      
+
       #id {
         animation: 2s test;
       }
@@ -155,16 +168,6 @@ fn valid_input_file() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn no_input_file() -> Result<(), Box<dyn std::error::Error>> {
-  let mut cmd = Command::cargo_bin("lightningcss")?;
-  cmd.assert().failure().stderr(predicate::str::contains(
-    "The following required arguments were not provided:\n    <INPUT_FILE>",
-  ));
-
-  Ok(())
-}
-
-#[test]
 fn empty_input_file() -> Result<(), Box<dyn std::error::Error>> {
   let file = assert_fs::NamedTempFile::new("test.css")?;
   file.write_str("")?;
@@ -188,6 +191,80 @@ fn output_file_option() -> Result<(), Box<dyn std::error::Error>> {
         .foo {
           border: none;
         }"#}));
+
+  Ok(())
+}
+
+#[test]
+fn output_file_option_create_missing_directories() -> Result<(), Box<dyn std::error::Error>> {
+  let infile = test_file()?;
+  let outdir = assert_fs::TempDir::new()?;
+  let outfile = outdir.child("out.css");
+  outdir.close()?;
+  let mut cmd = Command::cargo_bin("lightningcss")?;
+  cmd.arg(infile.path());
+  cmd.arg("--output-file").arg(outfile.path());
+  cmd.assert().success();
+  outfile.assert(predicate::str::contains(indoc! {
+    r#"
+      .foo {
+        border: none;
+      }
+    "#
+  }));
+  fs::remove_dir_all(outfile.parent().unwrap())?;
+
+  Ok(())
+}
+
+#[test]
+fn multiple_input_files() -> Result<(), Box<dyn std::error::Error>> {
+  let infile = test_file()?;
+  let infile2 = test_file2()?;
+  let outdir = assert_fs::TempDir::new()?;
+  let mut cmd = Command::cargo_bin("lightningcss")?;
+  cmd.arg(infile.path());
+  cmd.arg(infile2.path());
+  cmd.arg("--output-dir").arg(outdir.path());
+  cmd.assert().success();
+  outdir
+    .child(infile.file_name().unwrap())
+    .assert(predicate::str::contains(indoc! {r#"
+        .foo {
+          border: none;
+        }"#}));
+  outdir
+    .child(infile2.file_name().unwrap())
+    .assert(predicate::str::contains(indoc! {r#"
+        .foo {
+          color: #ff0;
+        }"#}));
+
+  Ok(())
+}
+
+#[test]
+fn multiple_input_files_out_file() -> Result<(), Box<dyn std::error::Error>> {
+  let infile = test_file()?;
+  let infile2 = test_file2()?;
+  let outdir = assert_fs::TempDir::new()?;
+  let mut cmd = Command::cargo_bin("lightningcss")?;
+  cmd.arg(infile.path());
+  cmd.arg(infile2.path());
+  cmd.arg("--output-file").arg(outdir.path());
+  cmd.assert().failure();
+
+  Ok(())
+}
+
+#[test]
+fn multiple_input_files_stdout() -> Result<(), Box<dyn std::error::Error>> {
+  let infile = test_file()?;
+  let infile2 = test_file2()?;
+  let mut cmd = Command::cargo_bin("lightningcss")?;
+  cmd.arg(infile.path());
+  cmd.arg(infile2.path());
+  cmd.assert().failure();
 
   Ok(())
 }

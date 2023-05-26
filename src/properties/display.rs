@@ -11,6 +11,7 @@ use crate::printer::Printer;
 use crate::targets::Browsers;
 use crate::traits::{Parse, PropertyHandler, ToCss};
 use crate::vendor_prefix::VendorPrefix;
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 
@@ -25,12 +26,14 @@ enum_property! {
 }
 
 /// A [`<display-inside>`](https://drafts.csswg.org/css-display-3/#typedef-display-inside) value.
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
-  serde(rename_all = "kebab-case")
+  serde(tag = "type", content = "vendorPrefix", rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 #[allow(missing_docs)]
 pub enum DisplayInside {
   Flow,
@@ -106,8 +109,14 @@ impl DisplayInside {
 /// A pair of inside and outside display values, as used in the `display` property.
 ///
 /// See [Display](Display).
-#[derive(Debug, Clone, PartialEq, Visit)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct DisplayPair {
   /// The outside display value.
   pub outside: DisplayOutside,
@@ -319,14 +328,20 @@ enum_property! {
 }
 
 /// A value for the [display](https://drafts.csswg.org/css-display-3/#the-display-properties) property.
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
-  serde(tag = "type", content = "value", rename_all = "kebab-case")
+  serde(tag = "type", rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum Display {
   /// A display keyword.
+  #[cfg_attr(
+    feature = "serde",
+    serde(with = "crate::serialization::ValueWrapper::<DisplayKeyword>")
+  )]
   Keyword(DisplayKeyword),
   /// The inside and outside display values.
   Pair(DisplayPair),

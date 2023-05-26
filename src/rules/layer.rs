@@ -6,6 +6,7 @@ use crate::parser::DefaultAtRule;
 use crate::printer::Printer;
 use crate::traits::{Parse, ToCss};
 use crate::values::string::CowArcStr;
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 use smallvec::SmallVec;
@@ -14,8 +15,10 @@ use smallvec::SmallVec;
 /// a `@layer` or `@import` rule.
 ///
 /// Nested layers are represented using a list of identifiers. In CSS syntax, these are dot-separated.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(transparent))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct LayerName<'i>(#[cfg_attr(feature = "serde", serde(borrow))] pub SmallVec<[CowArcStr<'i>; 1]>);
 
 macro_rules! expect_non_whitespace {
@@ -70,7 +73,7 @@ impl<'i> ToCss for LayerName<'i> {
         dest.write_char('.')?;
       }
 
-      dest.write_str(name)?;
+      serialize_identifier(name, dest)?;
     }
 
     Ok(())
@@ -80,15 +83,18 @@ impl<'i> ToCss for LayerName<'i> {
 /// A [@layer statement](https://drafts.csswg.org/css-cascade-5/#layer-empty) rule.
 ///
 /// See also [LayerBlockRule](LayerBlockRule).
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct LayerStatementRule<'i> {
   /// The layer names to declare.
   #[cfg_attr(feature = "serde", serde(borrow))]
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub names: Vec<LayerName<'i>>,
   /// The location of the rule in the source file.
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub loc: Location,
 }
 
@@ -97,6 +103,7 @@ impl<'i> ToCss for LayerStatementRule<'i> {
   where
     W: std::fmt::Write,
   {
+    #[cfg(feature = "sourcemap")]
     dest.add_mapping(self.loc);
     dest.write_str("@layer ")?;
     self.names.to_css(dest)?;
@@ -105,17 +112,19 @@ impl<'i> ToCss for LayerStatementRule<'i> {
 }
 
 /// A [@layer block](https://drafts.csswg.org/css-cascade-5/#layer-block) rule.
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct LayerBlockRule<'i, R = DefaultAtRule> {
   /// The name of the layer to declare, or `None` to declare an anonymous layer.
   #[cfg_attr(feature = "serde", serde(borrow))]
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub name: Option<LayerName<'i>>,
   /// The rules within the `@layer` rule.
   pub rules: CssRuleList<'i, R>,
   /// The location of the rule in the source file.
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub loc: Location,
 }
 
@@ -131,11 +140,12 @@ impl<'i, T> LayerBlockRule<'i, T> {
   }
 }
 
-impl<'i, T: ToCss> ToCss for LayerBlockRule<'i, T> {
+impl<'a, 'i, T: ToCss> ToCss for LayerBlockRule<'i, T> {
   fn to_css<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError>
   where
     W: std::fmt::Write,
   {
+    #[cfg(feature = "sourcemap")]
     dest.add_mapping(self.loc);
     dest.write_str("@layer")?;
     if let Some(name) = &self.name {

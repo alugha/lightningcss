@@ -3,10 +3,12 @@
 use crate::css_modules::CssModule;
 use crate::dependencies::{Dependency, DependencyOptions};
 use crate::error::{Error, ErrorLocation, PrinterError, PrinterErrorKind};
-use crate::rules::Location;
+use crate::rules::{Location, StyleContext};
+use crate::selector::SelectorList;
 use crate::targets::Browsers;
 use crate::vendor_prefix::VendorPrefix;
 use cssparser::{serialize_identifier, serialize_name};
+#[cfg(feature = "sourcemap")]
 use parcel_sourcemap::{OriginalLocation, SourceMap};
 
 /// Options that control how CSS is serialized to a string.
@@ -15,7 +17,11 @@ pub struct PrinterOptions<'a> {
   /// Whether to minify the CSS, i.e. remove white space.
   pub minify: bool,
   /// An optional reference to a source map to write mappings into.
+  #[cfg(feature = "sourcemap")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "sourcemap")))]
   pub source_map: Option<&'a mut SourceMap>,
+  /// An optional project root path, used to generate relative paths for sources used in CSS module hashes.
+  pub project_root: Option<&'a str>,
   /// Browser targets to output the CSS for.
   pub targets: Option<Browsers>,
   /// Whether to analyze dependencies (i.e. `@import` and `url()`).
@@ -60,7 +66,11 @@ pub struct PseudoClasses<'a> {
 pub struct Printer<'a, 'b, 'c, W> {
   pub(crate) sources: Option<&'c Vec<String>>,
   dest: &'a mut W,
+  #[cfg(feature = "sourcemap")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "sourcemap")))]
   pub(crate) source_map: Option<&'a mut SourceMap>,
+  #[cfg(feature = "sourcemap")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "sourcemap")))]
   pub(crate) source_maps: Vec<Option<SourceMap>>,
   pub(crate) loc: Location,
   indent: u8,
@@ -76,6 +86,7 @@ pub struct Printer<'a, 'b, 'c, W> {
   pub(crate) dependencies: Option<Vec<Dependency>>,
   pub(crate) remove_imports: bool,
   pub(crate) pseudo_classes: Option<PseudoClasses<'a>>,
+  context: Option<&'a StyleContext<'a, 'b>>,
 }
 
 impl<'a, 'b, 'c, W: std::fmt::Write + Sized> Printer<'a, 'b, 'c, W> {
@@ -84,7 +95,9 @@ impl<'a, 'b, 'c, W: std::fmt::Write + Sized> Printer<'a, 'b, 'c, W> {
     Printer {
       sources: None,
       dest,
+      #[cfg(feature = "sourcemap")]
       source_map: options.source_map,
+      #[cfg(feature = "sourcemap")]
       source_maps: Vec::new(),
       loc: Location {
         source_index: 0,
@@ -106,6 +119,7 @@ impl<'a, 'b, 'c, W: std::fmt::Write + Sized> Printer<'a, 'b, 'c, W> {
       },
       remove_imports: matches!(&options.analyze_dependencies, Some(d) if d.remove_imports),
       pseudo_classes: options.pseudo_classes,
+      context: None,
     }
   }
 
@@ -207,6 +221,8 @@ impl<'a, 'b, 'c, W: std::fmt::Write + Sized> Printer<'a, 'b, 'c, W> {
   }
 
   /// Adds a mapping to the source map, if any.
+  #[cfg(feature = "sourcemap")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "sourcemap")))]
   pub fn add_mapping(&mut self, loc: Location) {
     self.loc = loc;
 
@@ -316,6 +332,29 @@ impl<'a, 'b, 'c, W: std::fmt::Write + Sized> Printer<'a, 'b, 'c, W> {
         column: loc.column,
       }),
     }
+  }
+
+  pub(crate) fn with_context<T, U, F: FnOnce(&mut Printer<'a, 'b, 'c, W>) -> Result<T, U>>(
+    &mut self,
+    selectors: &SelectorList,
+    f: F,
+  ) -> Result<T, U> {
+    let parent = std::mem::take(&mut self.context);
+    let ctx = StyleContext {
+      selectors: unsafe { std::mem::transmute(selectors) },
+      parent,
+    };
+
+    // I can't figure out what lifetime to use here to convince the compiler that
+    // the reference doesn't live beyond the function call.
+    self.context = Some(unsafe { std::mem::transmute(&ctx) });
+    let res = f(self);
+    self.context = parent;
+    res
+  }
+
+  pub(crate) fn context(&self) -> Option<&'a StyleContext<'a, 'b>> {
+    self.context.clone()
   }
 }
 

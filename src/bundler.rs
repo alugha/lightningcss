@@ -25,16 +25,20 @@
 
 use crate::{
   error::ErrorLocation,
+  parser::DefaultAtRuleParser,
   properties::{
     css_modules::Specifier,
-    custom::{CustomProperty, TokenList, TokenOrValue, UnparsedProperty, UnresolvedColor},
+    custom::{
+      CustomProperty, EnvironmentVariableName, TokenList, TokenOrValue, UnparsedProperty, UnresolvedColor,
+    },
     Property,
   },
   rules::{
     layer::{LayerBlockRule, LayerName},
     Location,
   },
-  values::ident::DashedIdentReference, traits::ToCss,
+  traits::{AtRuleParser, ToCss},
+  values::ident::DashedIdentReference,
 };
 use crate::{
   error::{Error, ParserError},
@@ -47,11 +51,9 @@ use crate::{
   },
   stylesheet::{ParserOptions, StyleSheet},
 };
-use cssparser::AtRuleParser;
 use dashmap::DashMap;
 use parcel_sourcemap::SourceMap;
 use rayon::prelude::*;
-use serde::Serialize;
 use std::{
   collections::HashSet,
   fs,
@@ -65,11 +67,17 @@ pub struct Bundler<'a, 'o, 's, P, T: AtRuleParser<'a>> {
   source_map: Option<Mutex<&'s mut SourceMap>>,
   fs: &'a P,
   source_indexes: DashMap<PathBuf, u32>,
-  stylesheets: Mutex<Vec<BundleStyleSheet<'a, 'o, T>>>,
-  options: ParserOptions<'o, 'a, T>,
+  stylesheets: Mutex<Vec<BundleStyleSheet<'a, 'o, T::AtRule>>>,
+  options: ParserOptions<'o, 'a>,
+  at_rule_parser: Mutex<AtRuleParserValue<'s, T>>,
 }
 
-struct BundleStyleSheet<'i, 'o, T: AtRuleParser<'i>> {
+enum AtRuleParserValue<'a, T> {
+  Owned(T),
+  Borrowed(&'a mut T),
+}
+
+struct BundleStyleSheet<'i, 'o, T> {
   stylesheet: Option<StyleSheet<'i, 'o, T>>,
   dependencies: Vec<u32>,
   css_modules_deps: Vec<u32>,
@@ -143,7 +151,8 @@ impl Drop for FileProvider {
 }
 
 /// An error that could occur during bundling.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
+#[cfg_attr(any(feature = "serde", feature = "nodejs"), derive(serde::Serialize))]
 pub enum BundleErrorKind<'i, T: std::error::Error> {
   /// A parser error occurred.
   ParserError(ParserError<'i>),
@@ -154,7 +163,7 @@ pub enum BundleErrorKind<'i, T: std::error::Error> {
   /// Unsupported media query boolean logic was encountered.
   UnsupportedMediaBooleanLogic,
   /// A custom resolver error.
-  ResolverError(#[serde(skip)] T),
+  ResolverError(#[cfg_attr(any(feature = "serde", feature = "nodejs"), serde(skip))] T),
 }
 
 impl<'i, T: std::error::Error> From<Error<ParserError<'i>>> for Error<BundleErrorKind<'i, T>> {
@@ -187,20 +196,46 @@ impl<'i, T: std::error::Error> BundleErrorKind<'i, T> {
   }
 }
 
-impl<'a, 'o, 's, P: SourceProvider, T: AtRuleParser<'a> + Clone + Sync + Send> Bundler<'a, 'o, 's, P, T>
-where
-   T::AtRule: Sync + Send + ToCss
-{
+impl<'a, 'o, 's, P: SourceProvider> Bundler<'a, 'o, 's, P, DefaultAtRuleParser> {
   /// Creates a new Bundler using the given source provider.
   /// If a source map is given, the content of each source file included in the bundle will
   /// be added accordingly.
-  pub fn new(fs: &'a P, source_map: Option<&'s mut SourceMap>, options: ParserOptions<'o, 'a, T>) -> Self {
+  pub fn new(
+    fs: &'a P,
+    source_map: Option<&'s mut SourceMap>,
+    options: ParserOptions<'o, 'a>,
+  ) -> Bundler<'a, 'o, 's, P, DefaultAtRuleParser> {
     Bundler {
       source_map: source_map.map(Mutex::new),
       fs,
       source_indexes: DashMap::new(),
       stylesheets: Mutex::new(Vec::new()),
       options,
+      at_rule_parser: Mutex::new(AtRuleParserValue::Owned(DefaultAtRuleParser)),
+    }
+  }
+}
+
+impl<'a, 'o, 's, P: SourceProvider, T: AtRuleParser<'a> + Clone + Sync + Send> Bundler<'a, 'o, 's, P, T>
+where
+  T::AtRule: Sync + Send + ToCss,
+{
+  /// Creates a new Bundler using the given source provider.
+  /// If a source map is given, the content of each source file included in the bundle will
+  /// be added accordingly.
+  pub fn new_with_at_rule_parser(
+    fs: &'a P,
+    source_map: Option<&'s mut SourceMap>,
+    options: ParserOptions<'o, 'a>,
+    at_rule_parser: &'s mut T,
+  ) -> Self {
+    Bundler {
+      source_map: source_map.map(Mutex::new),
+      fs,
+      source_indexes: DashMap::new(),
+      stylesheets: Mutex::new(Vec::new()),
+      options,
+      at_rule_parser: Mutex::new(AtRuleParserValue::Borrowed(at_rule_parser)),
     }
   }
 
@@ -208,7 +243,7 @@ where
   pub fn bundle<'e>(
     &mut self,
     entry: &'e Path,
-  ) -> Result<StyleSheet<'a, 'o, T>, Error<BundleErrorKind<'a, P::Error>>> {
+  ) -> Result<StyleSheet<'a, 'o, T::AtRule>, Error<BundleErrorKind<'a, P::Error>>> {
     // Phase 1: load and parse all files. This is done in parallel.
     self.load_file(
       &entry,
@@ -342,7 +377,15 @@ where
     opts.filename = filename.to_owned();
     opts.source_index = source_index;
 
-    let mut stylesheet = StyleSheet::parse(code, opts)?;
+    let mut stylesheet = {
+      let mut at_rule_parser = self.at_rule_parser.lock().unwrap();
+      let at_rule_parser = match &mut *at_rule_parser {
+        AtRuleParserValue::Owned(owned) => owned,
+        AtRuleParserValue::Borrowed(borrowed) => *borrowed,
+      };
+
+      StyleSheet::<T::AtRule>::parse_with(code, opts, at_rule_parser)?
+    };
 
     if let Some(source_map) = &self.source_map {
       // Only add source if we don't have an input source map.
@@ -547,7 +590,11 @@ where
   fn order(&mut self) {
     process(self.stylesheets.get_mut().unwrap(), 0, &mut HashSet::new());
 
-    fn process<'i, T: AtRuleParser<'i>>(stylesheets: &mut Vec<BundleStyleSheet<'i, '_, T>>, source_index: u32, visited: &mut HashSet<u32>) {
+    fn process<'i, T>(
+      stylesheets: &mut Vec<BundleStyleSheet<'i, '_, T>>,
+      source_index: u32,
+      visited: &mut HashSet<u32>,
+    ) {
       if visited.contains(&source_index) {
         return;
       }
@@ -586,10 +633,10 @@ where
   fn inline(&mut self, dest: &mut Vec<CssRule<'a, T::AtRule>>) {
     process(self.stylesheets.get_mut().unwrap(), 0, dest);
 
-    fn process<'a, T: AtRuleParser<'a>>(
+    fn process<'a, T>(
       stylesheets: &mut Vec<BundleStyleSheet<'a, '_, T>>,
       source_index: u32,
-      dest: &mut Vec<CssRule<'a, T::AtRule>>,
+      dest: &mut Vec<CssRule<'a, T>>,
     ) {
       let stylesheet = &mut stylesheets[source_index as usize];
       let mut rules = std::mem::take(&mut stylesheet.stylesheet.as_mut().unwrap().rules.0);
@@ -695,6 +742,14 @@ fn visit_vars<'a, 'b>(
           }
           return Some(&mut var.name);
         }
+        Some(TokenOrValue::Env(env)) => {
+          if let Some(fallback) = &mut env.fallback {
+            stack.push(fallback.0.iter_mut());
+          }
+          if let EnvironmentVariableName::Custom(name) = &mut env.name {
+            return Some(name);
+          }
+        }
         Some(TokenOrValue::UnresolvedColor(color)) => match color {
           UnresolvedColor::RGB { alpha, .. } | UnresolvedColor::HSL { alpha, .. } => {
             stack.push(alpha.0.iter_mut());
@@ -716,12 +771,14 @@ mod tests {
   use super::*;
   use crate::{
     css_modules::{self, CssModuleExports, CssModuleReference},
+    parser::ParserFlags,
     stylesheet::{MinifyOptions, PrinterOptions},
     targets::Browsers,
   };
   use indoc::indoc;
   use std::collections::HashMap;
 
+  #[derive(Clone)]
   struct TestProvider {
     map: HashMap<PathBuf, String>,
   }
@@ -789,7 +846,11 @@ mod tests {
     stylesheet.to_css(PrinterOptions::default()).unwrap().code
   }
 
-  fn bundle_css_module<P: SourceProvider>(fs: P, entry: &str) -> (String, CssModuleExports) {
+  fn bundle_css_module<P: SourceProvider>(
+    fs: P,
+    entry: &str,
+    project_root: Option<&str>,
+  ) -> (String, CssModuleExports) {
     let mut bundler = Bundler::new(
       &fs,
       None,
@@ -803,7 +864,12 @@ mod tests {
     );
     let mut stylesheet = bundler.bundle(Path::new(entry)).unwrap();
     stylesheet.minify(MinifyOptions::default()).unwrap();
-    let res = stylesheet.to_css(PrinterOptions::default()).unwrap();
+    let res = stylesheet
+      .to_css(PrinterOptions {
+        project_root,
+        ..PrinterOptions::default()
+      })
+      .unwrap();
     (res.code, res.exports.unwrap())
   }
 
@@ -812,7 +878,7 @@ mod tests {
       &fs,
       None,
       ParserOptions {
-        custom_media: true,
+        flags: ParserFlags::CUSTOM_MEDIA,
         ..ParserOptions::default()
       },
     );
@@ -892,7 +958,7 @@ mod tests {
       .b {
         color: green;
       }
-      
+
       .a {
         color: red;
       }
@@ -921,7 +987,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -950,7 +1016,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -981,7 +1047,7 @@ mod tests {
           }
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -1011,7 +1077,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -1036,12 +1102,12 @@ mod tests {
     assert_eq!(
       res,
       indoc! { r#"
-      @supports ((color: red) or (foo: bar)) {
+      @supports (color: red) or (foo: bar) {
         .b {
           color: green;
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -1074,7 +1140,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       @media print {
         .b {
           color: #ff0;
@@ -1138,7 +1204,7 @@ mod tests {
       .b {
         color: green;
       }
-      
+
       .a {
         color: red;
       }
@@ -1165,7 +1231,7 @@ mod tests {
       .b {
         color: green;
       }
-      
+
       .a {
         color: red;
       }
@@ -1229,7 +1295,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -1258,7 +1324,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -1297,7 +1363,7 @@ mod tests {
           color: green;
         }
       }
-      
+
       .a {
         color: red;
       }
@@ -1335,7 +1401,7 @@ mod tests {
           "/a.css": r#"
           @layer bar, foo;
           @import "b.css" layer(foo);
-          
+
           @layer bar {
             div {
               background: red;
@@ -1345,7 +1411,7 @@ mod tests {
           "/b.css": r#"
           @layer qux, baz;
           @import "c.css" layer(baz);
-          
+
           @layer qux {
             div {
               background: green;
@@ -1355,7 +1421,7 @@ mod tests {
           "/c.css": r#"
           div {
             background: yellow;
-          }      
+          }
         "#
         },
       },
@@ -1380,7 +1446,7 @@ mod tests {
           }
         }
       }
-      
+
       @layer bar {
         div {
           background: red;
@@ -1414,20 +1480,20 @@ mod tests {
     assert_eq!(
       res,
       indoc! { r#"
-      @media (min-width: 1000px) {
+      @media (width >= 1000px) {
         @layer bar {
           #box {
             background: green;
           }
         }
       }
-      
+
       @layer baz {
         #box {
           background: purple;
         }
       }
-      
+
       @layer bar {
         #box {
           background: #ff0;
@@ -1534,7 +1600,7 @@ mod tests {
           "/c.css": r#"
           body {
             background: white;
-            color: black; 
+            color: black;
           }
         "#
         },
@@ -1688,6 +1754,7 @@ mod tests {
         },
       },
       "/a.css",
+      None,
     );
     assert_eq!(
       code,
@@ -1722,6 +1789,7 @@ mod tests {
         },
       },
       "/a.css",
+      None,
     );
     assert_eq!(
       code,
@@ -1763,6 +1831,7 @@ mod tests {
         },
       },
       "/a.css",
+      None,
     );
     assert_eq!(
       code,
@@ -1790,6 +1859,7 @@ mod tests {
           .a {
             background: var(--bg from "./b.css", var(--fallback from "./b.css"));
             color: rgb(255 255 255 / var(--opacity from "./b.css"));
+            width: env(--env, var(--env-fallback from "./env.css"));
           }
         "#,
           "/b.css": r#"
@@ -1798,10 +1868,16 @@ mod tests {
             --fallback: yellow;
             --opacity: 0.5;
           }
+        "#,
+          "/env.css": r#"
+          .env {
+            --env-fallback: 20px;
+          }
         "#
         },
       },
       "/a.css",
+      None,
     );
     assert_eq!(
       code,
@@ -1812,18 +1888,77 @@ mod tests {
         --_8Cs9ZG_opacity: .5;
       }
 
+      .GbJUva_env {
+        --GbJUva_env-fallback: 20px;
+      }
+
       ._6lixEq_a {
         background: var(--_8Cs9ZG_bg, var(--_8Cs9ZG_fallback));
         color: rgb(255 255 255 / var(--_8Cs9ZG_opacity));
+        width: env(--_6lixEq_env, var(--GbJUva_env-fallback));
       }
     "#}
     );
     assert_eq!(
       flatten_exports(exports),
       map! {
-        "a" => "_6lixEq_a"
+        "a" => "_6lixEq_a",
+        "--env" => "--_6lixEq_env"
       }
     );
+
+    // Hashes are stable between project roots.
+    let expected = indoc! { r#"
+    .dyGcAa_b {
+      background: #ff0;
+    }
+
+    .CK9avG_a {
+      background: #fff;
+    }
+  "#};
+
+    let (code, _) = bundle_css_module(
+      TestProvider {
+        map: fs! {
+          "/foo/bar/a.css": r#"
+        @import "b.css";
+        .a {
+          background: white;
+        }
+      "#,
+          "/foo/bar/b.css": r#"
+        .b {
+          background: yellow;
+        }
+      "#
+        },
+      },
+      "/foo/bar/a.css",
+      Some("/foo/bar"),
+    );
+    assert_eq!(code, expected);
+
+    let (code, _) = bundle_css_module(
+      TestProvider {
+        map: fs! {
+          "/x/y/z/a.css": r#"
+      @import "b.css";
+      .a {
+        background: white;
+      }
+    "#,
+          "/x/y/z/b.css": r#"
+      .b {
+        background: yellow;
+      }
+    "#
+        },
+      },
+      "/x/y/z/a.css",
+      Some("/x/y/z"),
+    );
+    assert_eq!(code, expected);
   }
 
   #[test]
@@ -1831,16 +1966,16 @@ mod tests {
     let source = r#".imported {
       content: "yay, file support!";
     }
-    
+
     .selector {
       margin: 1em;
       background-color: #f60;
     }
-    
+
     .selector .nested {
       margin: 0.5em;
     }
-    
+
     /*# sourceMappingURL=data:application/json;base64,ewoJInZlcnNpb24iOiAzLAoJInNvdXJjZVJvb3QiOiAicm9vdCIsCgkiZmlsZSI6ICJzdGRvdXQiLAoJInNvdXJjZXMiOiBbCgkJInN0ZGluIiwKCQkic2Fzcy9fdmFyaWFibGVzLnNjc3MiLAoJCSJzYXNzL19kZW1vLnNjc3MiCgldLAoJInNvdXJjZXNDb250ZW50IjogWwoJCSJAaW1wb3J0IFwiX3ZhcmlhYmxlc1wiO1xuQGltcG9ydCBcIl9kZW1vXCI7XG5cbi5zZWxlY3RvciB7XG4gIG1hcmdpbjogJHNpemU7XG4gIGJhY2tncm91bmQtY29sb3I6ICRicmFuZENvbG9yO1xuXG4gIC5uZXN0ZWQge1xuICAgIG1hcmdpbjogJHNpemUgLyAyO1xuICB9XG59IiwKCQkiJGJyYW5kQ29sb3I6ICNmNjA7XG4kc2l6ZTogMWVtOyIsCgkJIi5pbXBvcnRlZCB7XG4gIGNvbnRlbnQ6IFwieWF5LCBmaWxlIHN1cHBvcnQhXCI7XG59IgoJXSwKCSJtYXBwaW5ncyI6ICJBRUFBLFNBQVMsQ0FBQztFQUNSLE9BQU8sRUFBRSxvQkFBcUI7Q0FDL0I7O0FGQ0QsU0FBUyxDQUFDO0VBQ1IsTUFBTSxFQ0hELEdBQUc7RURJUixnQkFBZ0IsRUNMTCxJQUFJO0NEVWhCOztBQVBELFNBQVMsQ0FJUCxPQUFPLENBQUM7RUFDTixNQUFNLEVDUEgsS0FBRztDRFFQIiwKCSJuYW1lcyI6IFtdCn0= */"#;
 
     let fs = TestProvider {

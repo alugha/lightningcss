@@ -9,22 +9,26 @@ use crate::error::{ParserError, PrinterError};
 use crate::prefixes::{is_webkit_gradient, Feature};
 use crate::printer::Printer;
 use crate::targets::Browsers;
-use crate::traits::{FallbackValues, Parse, ToCss};
+use crate::traits::{FallbackValues, IsCompatible, Parse, ToCss};
 use crate::values::string::CowArcStr;
 use crate::values::url::Url;
 use crate::vendor_prefix::VendorPrefix;
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 use smallvec::SmallVec;
 
 /// A CSS [`<image>`](https://www.w3.org/TR/css-images-3/#image-values) value.
-#[derive(Debug, Clone, PartialEq, Visit)]
-#[visit(visit_image, IMAGES)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
+#[cfg_attr(feature = "visitor", visit(visit_image, IMAGES))]
 #[cfg_attr(
   feature = "serde",
   derive(serde::Serialize, serde::Deserialize),
   serde(tag = "type", content = "value", rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub enum Image<'i> {
   /// The `none` keyword.
   None,
@@ -102,29 +106,33 @@ impl<'i> Image<'i> {
       _ => self.clone(),
     }
   }
+}
 
-  pub(crate) fn should_preserve_fallback(&self, fallback: &Option<Image>, targets: Option<Browsers>) -> bool {
-    if let (Some(fallback), Some(targets)) = (&fallback, targets) {
-      return !compat::Feature::ImageSet.is_compatible(targets)
-        && matches!(self, Image::ImageSet(..))
-        && !matches!(fallback, Image::ImageSet(..));
+impl<'i> IsCompatible for Image<'i> {
+  fn is_compatible(&self, browsers: Browsers) -> bool {
+    match self {
+      Image::Gradient(g) => match &**g {
+        Gradient::Linear(g) => {
+          compat::Feature::LinearGradient.is_compatible(browsers) && g.is_compatible(browsers)
+        }
+        Gradient::RepeatingLinear(g) => {
+          compat::Feature::RepeatingLinearGradient.is_compatible(browsers) && g.is_compatible(browsers)
+        }
+        Gradient::Radial(g) => {
+          compat::Feature::RadialGradient.is_compatible(browsers) && g.is_compatible(browsers)
+        }
+        Gradient::RepeatingRadial(g) => {
+          compat::Feature::RepeatingRadialGradient.is_compatible(browsers) && g.is_compatible(browsers)
+        }
+        Gradient::Conic(g) => compat::Feature::ConicGradient.is_compatible(browsers) && g.is_compatible(browsers),
+        Gradient::RepeatingConic(g) => {
+          compat::Feature::RepeatingConicGradient.is_compatible(browsers) && g.is_compatible(browsers)
+        }
+        Gradient::WebKitGradient(..) => is_webkit_gradient(browsers),
+      },
+      Image::ImageSet(i) => i.is_compatible(browsers),
+      Image::Url(..) | Image::None => true,
     }
-
-    false
-  }
-
-  pub(crate) fn should_preserve_fallbacks(
-    images: &SmallVec<[Image; 1]>,
-    fallback: Option<&SmallVec<[Image; 1]>>,
-    targets: Option<Browsers>,
-  ) -> bool {
-    if let (Some(fallback), Some(targets)) = (&fallback, targets) {
-      return !compat::Feature::ImageSet.is_compatible(targets)
-        && images.iter().any(|x| matches!(x, Image::ImageSet(..)))
-        && !fallback.iter().any(|x| matches!(x, Image::ImageSet(..)));
-    }
-
-    false
   }
 }
 
@@ -341,8 +349,15 @@ impl<'i> ToCss for Image<'i> {
 ///
 /// `image-set()` allows the user agent to choose between multiple versions of an image to
 /// display the most appropriate resolution or file type that it supports.
-#[derive(Debug, Clone, PartialEq, Visit)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct ImageSet<'i> {
   /// The image options to choose from.
   #[cfg_attr(feature = "serde", serde(borrow))]
@@ -412,12 +427,26 @@ impl<'i> ToCss for ImageSet<'i> {
   }
 }
 
+impl<'i> IsCompatible for ImageSet<'i> {
+  fn is_compatible(&self, browsers: Browsers) -> bool {
+    compat::Feature::ImageSet.is_compatible(browsers)
+      && self.options.iter().all(|opt| opt.image.is_compatible(browsers))
+  }
+}
+
 /// An image option within the `image-set()` function. See [ImageSet](ImageSet).
-#[derive(Debug, Clone, PartialEq, Visit)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct ImageSetOption<'i> {
   /// The image for this option.
-  #[skip_type]
+  #[cfg_attr(feature = "visitor", skip_type)]
   pub image: Image<'i>,
   /// The resolution of the image.
   pub resolution: Resolution,

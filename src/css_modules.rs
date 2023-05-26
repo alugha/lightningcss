@@ -13,8 +13,11 @@ use crate::properties::css_modules::{Composes, Specifier};
 use crate::selector::SelectorList;
 use data_encoding::{Encoding, Specification};
 use lazy_static::lazy_static;
+use pathdiff::diff_paths;
+#[cfg(any(feature = "serde", feature = "nodejs"))]
 use serde::Serialize;
 use smallvec::{smallvec, SmallVec};
+use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -162,8 +165,12 @@ pub enum Segment<'i> {
 /// A referenced name within a CSS module, e.g. via the `composes` property.
 ///
 /// See [CssModuleExport](CssModuleExport).
-#[derive(PartialEq, Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[derive(PartialEq, Debug, Clone)]
+#[cfg_attr(any(feature = "serde", feature = "nodejs"), derive(Serialize))]
+#[cfg_attr(
+  any(feature = "serde", feature = "nodejs"),
+  serde(tag = "type", rename_all = "lowercase")
+)]
 pub enum CssModuleReference {
   /// A local reference.
   Local {
@@ -185,8 +192,9 @@ pub enum CssModuleReference {
 }
 
 /// An exported value from a CSS module.
-#[derive(PartialEq, Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(PartialEq, Debug, Clone)]
+#[cfg_attr(any(feature = "serde", feature = "nodejs"), derive(Serialize))]
+#[cfg_attr(any(feature = "serde", feature = "nodejs"), serde(rename_all = "camelCase"))]
 pub struct CssModuleExport {
   /// The local (compiled) name for this export.
   pub name: String,
@@ -224,16 +232,32 @@ impl<'a, 'b, 'c> CssModule<'a, 'b, 'c> {
   pub fn new(
     config: &'a Config<'b>,
     sources: &'c Vec<String>,
+    project_root: Option<&'c str>,
     references: &'a mut HashMap<String, CssModuleReference>,
   ) -> Self {
+    let project_root = project_root.map(|p| Path::new(p));
+    let sources: Vec<&Path> = sources.iter().map(|filename| Path::new(filename)).collect();
+    let hashes = sources
+      .iter()
+      .map(|path| {
+        // Make paths relative to project root so hashes are stable.
+        let source = match project_root {
+          Some(project_root) if path.is_absolute() => {
+            diff_paths(path, project_root).map_or(Cow::Borrowed(*path), Cow::Owned)
+          }
+          _ => Cow::Borrowed(*path),
+        };
+        hash(
+          &source.to_string_lossy(),
+          matches!(config.pattern.segments[0], Segment::Hash),
+        )
+      })
+      .collect();
     Self {
       config,
-      sources: sources.iter().map(|filename| Path::new(filename)).collect(),
-      hashes: sources
-        .iter()
-        .map(|source| hash(&source, matches!(config.pattern.segments[0], Segment::Hash)))
-        .collect(),
       exports_by_source_index: sources.iter().map(|_| HashMap::new()).collect(),
+      sources,
+      hashes,
       references,
     }
   }
@@ -339,7 +363,7 @@ impl<'a, 'b, 'c> CssModule<'a, 'b, 'c> {
                   "--".into(),
                   &self.hashes[source_index as usize],
                   &self.sources[source_index as usize],
-                  name,
+                  &name[2..],
                 )
                 .unwrap(),
               composes: vec![],

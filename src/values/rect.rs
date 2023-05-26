@@ -2,7 +2,8 @@
 
 use crate::error::{ParserError, PrinterError};
 use crate::printer::Printer;
-use crate::traits::{Parse, ToCss};
+use crate::traits::{IsCompatible, Parse, ToCss};
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 
@@ -11,8 +12,10 @@ use cssparser::*;
 ///
 /// When serialized, as few components as possible are written when
 /// there are duplicate values.
-#[derive(Clone, Debug, PartialEq, Eq, Visit)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct Rect<T>(
   /// The top component.
   pub T,
@@ -113,5 +116,14 @@ where
     }
     dest.write_str(" ")?;
     self.3.to_css(dest)
+  }
+}
+
+impl<T: IsCompatible> IsCompatible for Rect<T> {
+  fn is_compatible(&self, browsers: crate::targets::Browsers) -> bool {
+    self.0.is_compatible(browsers)
+      && self.1.is_compatible(browsers)
+      && self.2.is_compatible(browsers)
+      && self.3.is_compatible(browsers)
   }
 }

@@ -5,6 +5,7 @@ use crate::printer::Printer;
 use crate::properties::css_modules::Specifier;
 use crate::traits::{Parse, ParseWithOptions, ToCss};
 use crate::values::string::CowArcStr;
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 use smallvec::SmallVec;
@@ -18,9 +19,12 @@ use super::string::impl_string_type;
 /// Custom idents are author defined, and allow any valid identifier except the
 /// [CSS-wide keywords](https://www.w3.org/TR/css-values-4/#css-wide-keywords).
 /// They may be renamed to include a hash when compiled as part of a CSS module.
-#[derive(Debug, Clone, Eq, Hash, Visit)]
-#[visit(visit_custom_ident, CUSTOM_IDENTS)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Eq, Hash)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
+#[cfg_attr(feature = "visitor", visit(visit_custom_ident, CUSTOM_IDENTS))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(transparent))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct CustomIdent<'i>(#[cfg_attr(feature = "serde", serde(borrow))] pub CowArcStr<'i>);
 
 impl<'i> Parse<'i> for CustomIdent<'i> {
@@ -56,9 +60,12 @@ pub type CustomIdentList<'i> = SmallVec<[CustomIdent<'i>; 1]>;
 ///
 /// Dashed idents are used in cases where an identifier can be either author defined _or_ CSS-defined.
 /// Author defined idents must start with two dash characters ("--") or parsing will fail.
-#[derive(Debug, Clone, Eq, Hash, Visit)]
-#[visit(visit_dashed_ident, DASHED_IDENTS)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Eq, Hash)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
+#[cfg_attr(feature = "visitor", visit(visit_dashed_ident, DASHED_IDENTS))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct DashedIdent<'i>(#[cfg_attr(feature = "serde", serde(borrow))] pub CowArcStr<'i>);
 
 impl<'i> Parse<'i> for DashedIdent<'i> {
@@ -82,6 +89,21 @@ impl<'i> ToCss for DashedIdent<'i> {
   }
 }
 
+#[cfg(feature = "serde")]
+impl<'i, 'de: 'i> serde::Deserialize<'de> for DashedIdent<'i> {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    let ident = CowArcStr::deserialize(deserializer)?;
+    if !ident.starts_with("--") {
+      return Err(serde::de::Error::custom("Dashed idents must start with --"));
+    }
+
+    Ok(DashedIdent(ident))
+  }
+}
+
 /// A CSS [`<dashed-ident>`](https://www.w3.org/TR/css-values-4/#dashed-idents) reference.
 ///
 /// Dashed idents are used in cases where an identifier can be either author defined _or_ CSS-defined.
@@ -89,8 +111,11 @@ impl<'i> ToCss for DashedIdent<'i> {
 ///
 /// In CSS modules, when the `dashed_idents` option is enabled, the identifier may be followed by the
 /// `from` keyword and an argument indicating where the referenced identifier is declared (e.g. a filename).
-#[derive(Debug, Clone, PartialEq, Visit)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct DashedIdentReference<'i> {
   /// The referenced identifier.
   #[cfg_attr(feature = "serde", serde(borrow))]
@@ -100,10 +125,10 @@ pub struct DashedIdentReference<'i> {
   pub from: Option<Specifier<'i>>,
 }
 
-impl<'i, T> ParseWithOptions<'i, T> for DashedIdentReference<'i> {
+impl<'i> ParseWithOptions<'i> for DashedIdentReference<'i> {
   fn parse_with_options<'t>(
     input: &mut Parser<'i, 't>,
-    options: &crate::stylesheet::ParserOptions<T>,
+    options: &crate::stylesheet::ParserOptions,
   ) -> Result<Self, ParseError<'i, ParserError<'i>>> {
     let ident = DashedIdent::parse(input)?;
 
@@ -143,8 +168,11 @@ impl<'i> ToCss for DashedIdentReference<'i> {
 }
 
 /// A CSS [`<ident>`](https://www.w3.org/TR/css-values-4/#css-css-identifier).
-#[derive(Debug, Clone, Eq, Hash, Default, Visit)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Eq, Hash, Default)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(transparent))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct Ident<'i>(#[cfg_attr(feature = "serde", serde(borrow))] pub CowArcStr<'i>);
 
 impl<'i> Parse<'i> for Ident<'i> {

@@ -23,6 +23,7 @@ use crate::sink::Push;
 use smallvec::{self, SmallVec};
 use std::cmp;
 use std::iter;
+use std::ops::{Add, AddAssign};
 use std::ptr;
 use std::slice;
 
@@ -187,7 +188,7 @@ fn split_from_end<T>(s: &[T], at: usize) -> (&[T], &[T]) {
 
 bitflags! {
     /// Flags that indicate at which point of parsing a selector are we.
-    #[derive(Default)]
+    #[derive(Default, Clone, Copy, Debug, Eq, PartialEq, Hash)]
     pub (crate) struct SelectorFlags : u8 {
         const HAS_PSEUDO = 1 << 0;
         const HAS_SLOTTED = 1 << 1;
@@ -195,7 +196,7 @@ bitflags! {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct SpecificityAndFlags {
   /// There are two free bits here, since we use ten bits for each specificity
   /// kind (id, class, element).
@@ -228,11 +229,29 @@ impl SpecificityAndFlags {
 
 const MAX_10BIT: u32 = (1u32 << 10) - 1;
 
-#[derive(Add, AddAssign, Clone, Copy, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Default, Eq, Ord, PartialEq, PartialOrd)]
 struct Specificity {
   id_selectors: u32,
   class_like_selectors: u32,
   element_selectors: u32,
+}
+impl Add for Specificity {
+  type Output = Specificity;
+
+  fn add(self, rhs: Self) -> Self::Output {
+    Specificity {
+      id_selectors: self.id_selectors + rhs.id_selectors,
+      class_like_selectors: self.class_like_selectors + rhs.class_like_selectors,
+      element_selectors: self.element_selectors + rhs.element_selectors,
+    }
+  }
+}
+impl AddAssign for Specificity {
+  fn add_assign(&mut self, rhs: Self) {
+    self.id_selectors += rhs.id_selectors;
+    self.element_selectors += rhs.element_selectors;
+    self.class_like_selectors += rhs.class_like_selectors;
+  }
 }
 
 impl From<u32> for Specificity {
@@ -302,23 +321,26 @@ where
       | Component::AttributeInNoNamespace { .. }
       | Component::AttributeInNoNamespaceExists { .. }
       | Component::AttributeOther(..)
-      | Component::FirstChild
-      | Component::LastChild
-      | Component::OnlyChild
       | Component::Root
       | Component::Empty
       | Component::Scope
-      | Component::NthChild(..)
-      | Component::NthLastChild(..)
-      | Component::NthCol(..)
-      | Component::NthLastCol(..)
-      | Component::NthOfType(..)
-      | Component::NthLastOfType(..)
-      | Component::FirstOfType
-      | Component::LastOfType
-      | Component::OnlyOfType
+      | Component::Nth(..)
       | Component::NonTSPseudoClass(..) => {
         specificity.class_like_selectors += 1;
+      }
+      Component::NthOf(ref nth_of_data) => {
+        // https://drafts.csswg.org/selectors/#specificity-rules:
+        //
+        //     The specificity of the :nth-last-child() pseudo-class,
+        //     like the :nth-child() pseudo-class, combines the
+        //     specificity of a regular pseudo-class with that of its
+        //     selector argument S.
+        specificity.class_like_selectors += 1;
+        let mut max = 0;
+        for selector in nth_of_data.selectors() {
+          max = std::cmp::max(selector.specificity(), max);
+        }
+        *specificity += Specificity::from(max);
       }
       Component::Negation(ref list) | Component::Is(ref list) | Component::Any(_, ref list) => {
         // https://drafts.csswg.org/selectors/#specificity-rules:

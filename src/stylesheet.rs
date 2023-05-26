@@ -9,17 +9,19 @@ use crate::css_modules::{CssModule, CssModuleExports, CssModuleReferences};
 use crate::declaration::{DeclarationBlock, DeclarationHandler};
 use crate::dependencies::Dependency;
 use crate::error::{Error, ErrorLocation, MinifyErrorKind, ParserError, PrinterError, PrinterErrorKind};
-use crate::parser::{DefaultAtRuleParser, TopLevelRuleParser};
+use crate::parser::{DefaultAtRule, DefaultAtRuleParser, TopLevelRuleParser};
 use crate::printer::Printer;
 use crate::rules::{CssRule, CssRuleList, MinifyContext};
 use crate::targets::Browsers;
-use crate::traits::ToCss;
+use crate::traits::{AtRuleParser, ToCss};
+#[cfg(feature = "visitor")]
 use crate::visitor::{Visit, VisitTypes, Visitor};
-use cssparser::{AtRuleParser, Parser, ParserInput, RuleListParser};
+use cssparser::{Parser, ParserInput, RuleListParser};
+#[cfg(feature = "sourcemap")]
 use parcel_sourcemap::SourceMap;
 use std::collections::{HashMap, HashSet};
 
-pub use crate::parser::ParserOptions;
+pub use crate::parser::{ParserFlags, ParserOptions};
 pub use crate::printer::PrinterOptions;
 pub use crate::printer::PseudoClasses;
 
@@ -58,20 +60,20 @@ pub use crate::printer::PseudoClasses;
 /// assert_eq!(res.code, ".foo, .bar {\n  color: red;\n}\n");
 /// ```
 #[derive(Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct StyleSheet<'i, 'o, T: AtRuleParser<'i> = DefaultAtRuleParser> {
+#[cfg_attr(
+  feature = "serde",
+  derive(serde::Serialize, serde::Deserialize),
+  serde(rename_all = "camelCase")
+)]
+#[cfg_attr(
+  feature = "jsonschema",
+  derive(schemars::JsonSchema),
+  schemars(rename = "StyleSheet", bound = "T: schemars::JsonSchema")
+)]
+pub struct StyleSheet<'i, 'o, T = DefaultAtRule> {
   /// A list of top-level rules within the style sheet.
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      borrow,
-      bound(
-        serialize = "T::AtRule: serde::Serialize",
-        deserialize = "T::AtRule: serde::Deserialize<'de>"
-      )
-    )
-  )]
-  pub rules: CssRuleList<'i, T::AtRule>,
+  #[cfg_attr(feature = "serde", serde(borrow))]
+  pub rules: CssRuleList<'i, T>,
   /// A list of file names for all source files included within the style sheet.
   /// Sources are referenced by index in the `loc` property of each rule.
   pub sources: Vec<String>,
@@ -79,7 +81,7 @@ pub struct StyleSheet<'i, 'o, T: AtRuleParser<'i> = DefaultAtRuleParser> {
   pub(crate) source_map_urls: Vec<Option<String>>,
   #[cfg_attr(feature = "serde", serde(skip))]
   /// The options the style sheet was originally parsed with.
-  options: ParserOptions<'o, 'i, T>,
+  options: ParserOptions<'o, 'i>,
 }
 
 /// Options for the `minify` function of a [StyleSheet](StyleSheet)
@@ -110,15 +112,22 @@ pub struct ToCssResult {
   pub dependencies: Option<Vec<Dependency>>,
 }
 
-impl<'i, 'o, T: AtRuleParser<'i>> StyleSheet<'i, 'o, T>
+impl<'i, 'o> StyleSheet<'i, 'o, DefaultAtRule> {
+  /// Parse a style sheet from a string.
+  pub fn parse(code: &'i str, options: ParserOptions<'o, 'i>) -> Result<Self, Error<ParserError<'i>>> {
+    Self::parse_with(code, options, &mut DefaultAtRuleParser)
+  }
+}
+
+impl<'i, 'o, T> StyleSheet<'i, 'o, T>
 where
-  T::AtRule: ToCss,
+  T: ToCss,
 {
   /// Creates a new style sheet with the given source filenames and rules.
   pub fn new(
     sources: Vec<String>,
-    rules: CssRuleList<'i, T::AtRule>,
-    options: ParserOptions<'o, 'i, T>,
+    rules: CssRuleList<'i, T>,
+    options: ParserOptions<'o, 'i>,
   ) -> StyleSheet<'i, 'o, T> {
     StyleSheet {
       sources,
@@ -129,11 +138,15 @@ where
   }
 
   /// Parse a style sheet from a string.
-  pub fn parse(code: &'i str, mut options: ParserOptions<'o, 'i, T>) -> Result<Self, Error<ParserError<'i>>> {
+  pub fn parse_with<P: AtRuleParser<'i, AtRule = T>>(
+    code: &'i str,
+    mut options: ParserOptions<'o, 'i>,
+    at_rule_parser: &mut P,
+  ) -> Result<Self, Error<ParserError<'i>>> {
     let mut input = ParserInput::new(&code);
     let mut parser = Parser::new(&mut input);
     let mut rule_list_parser =
-      RuleListParser::new_for_stylesheet(&mut parser, TopLevelRuleParser::new(&mut options));
+      RuleListParser::new_for_stylesheet(&mut parser, TopLevelRuleParser::new(&mut options, at_rule_parser));
 
     let mut rules = vec![];
     while let Some(rule) = rule_list_parser.next() {
@@ -168,6 +181,8 @@ where
   }
 
   /// Returns the inline source map associated with the source at the given index.
+  #[cfg(feature = "sourcemap")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "sourcemap")))]
   pub fn source_map(&self, source_index: usize) -> Option<SourceMap> {
     SourceMap::from_data_url("/", self.source_map_url(source_index)?).ok()
   }
@@ -180,7 +195,7 @@ where
 
     // @custom-media rules may be defined after they are referenced, but may only be defined at the top level
     // of a stylesheet. Do a pre-scan here and create a lookup table by name.
-    let custom_media = if self.options.custom_media
+    let custom_media = if self.options.flags.contains(ParserFlags::CUSTOM_MEDIA)
       && options.targets.is_some()
       && !Feature::CustomMediaQueries.is_compatible(options.targets.unwrap())
     {
@@ -220,16 +235,22 @@ where
   pub fn to_css(&self, options: PrinterOptions) -> Result<ToCssResult, Error<PrinterErrorKind>> {
     // Make sure we always have capacity > 0: https://github.com/napi-rs/napi-rs/issues/1124.
     let mut dest = String::with_capacity(1);
+    let project_root = options.project_root.clone();
     let mut printer = Printer::new(&mut dest, options);
 
-    printer.sources = Some(&self.sources);
+    #[cfg(feature = "sourcemap")]
+    {
+      printer.sources = Some(&self.sources);
+    }
+
+    #[cfg(feature = "sourcemap")]
     if printer.source_map.is_some() {
       printer.source_maps = self.sources.iter().enumerate().map(|(i, _)| self.source_map(i)).collect();
     }
 
     if let Some(config) = &self.options.css_modules {
       let mut references = HashMap::new();
-      printer.css_module = Some(CssModule::new(config, &self.sources, &mut references));
+      printer.css_module = Some(CssModule::new(config, &self.sources, project_root, &mut references));
 
       self.rules.to_css(&mut printer)?;
       printer.newline()?;
@@ -256,15 +277,16 @@ where
   }
 }
 
-impl<'i, 'o, T, V> Visit<'i, T::AtRule, V> for StyleSheet<'i, 'o, T>
+#[cfg(feature = "visitor")]
+#[cfg_attr(docsrs, doc(cfg(feature = "visitor")))]
+impl<'i, 'o, T, V> Visit<'i, T, V> for StyleSheet<'i, 'o, T>
 where
-  T: AtRuleParser<'i>,
-  T::AtRule: Visit<'i, T::AtRule, V>,
-  V: Visitor<'i, T::AtRule>,
+  T: Visit<'i, T, V>,
+  V: Visitor<'i, T>,
 {
   const CHILD_TYPES: VisitTypes = VisitTypes::all();
 
-  fn visit_children(&mut self, visitor: &mut V) {
+  fn visit_children(&mut self, visitor: &mut V) -> Result<(), V::Error> {
     self.rules.visit(visitor)
   }
 }
@@ -294,19 +316,20 @@ where
 /// let res = style.to_css(PrinterOptions::default()).unwrap();
 /// assert_eq!(res.code, "color: #ff0; font-family: Helvetica");
 /// ```
-#[derive(Visit)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "into_owned", derive(lightningcss_derive::IntoOwned))]
 pub struct StyleAttribute<'i> {
   /// The declarations in the style attribute.
   pub declarations: DeclarationBlock<'i>,
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   sources: Vec<String>,
 }
 
 impl<'i> StyleAttribute<'i> {
   /// Parses a style attribute from a string.
-  pub fn parse<T>(
+  pub fn parse(
     code: &'i str,
-    options: ParserOptions<'_, 'i, T>,
+    options: ParserOptions<'_, 'i>,
   ) -> Result<StyleAttribute<'i>, Error<ParserError<'i>>> {
     let mut input = ParserInput::new(&code);
     let mut parser = Parser::new(&mut input);
@@ -327,6 +350,7 @@ impl<'i> StyleAttribute<'i> {
 
   /// Serializes the style attribute to a CSS string.
   pub fn to_css(&self, options: PrinterOptions) -> Result<ToCssResult, PrinterError> {
+    #[cfg(feature = "sourcemap")]
     assert!(
       options.source_map.is_none(),
       "Source maps are not supported for style attributes"

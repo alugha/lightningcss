@@ -4,6 +4,7 @@ use super::percentage::NumberOrPercentage;
 use crate::error::{ParserError, PrinterError};
 use crate::printer::Printer;
 use crate::traits::{Parse, ToCss};
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 
@@ -11,8 +12,10 @@ use cssparser::*;
 /// used to represent opacity.
 ///
 /// Parses either a `<number>` or `<percentage>`, but is always stored and serialized as a number.
-#[derive(Debug, Clone, PartialEq, Visit)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(transparent))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct AlphaValue(pub f32);
 
 impl<'i> Parse<'i> for AlphaValue {

@@ -1,5 +1,6 @@
 //! Style rules.
 
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use super::Location;
@@ -11,42 +12,42 @@ use crate::error::ParserError;
 use crate::error::{MinifyError, PrinterError, PrinterErrorKind};
 use crate::parser::DefaultAtRule;
 use crate::printer::Printer;
-use crate::rules::{CssRuleList, StyleContext, ToCssWithContext};
+use crate::rules::CssRuleList;
 use crate::selector::{is_compatible, is_unused, SelectorList};
 use crate::targets::Browsers;
 use crate::traits::ToCss;
 use crate::vendor_prefix::VendorPrefix;
+#[cfg(feature = "visitor")]
 use crate::visitor::Visit;
 use cssparser::*;
 
-#[cfg(feature = "serde")]
-use crate::selector::{deserialize_selectors, serialize_selectors};
-
 /// A CSS [style rule](https://drafts.csswg.org/css-syntax/#style-rules).
-#[derive(Debug, PartialEq, Clone, Visit)]
+#[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(feature = "visitor", derive(Visit))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
 pub struct StyleRule<'i, R = DefaultAtRule> {
   /// The selectors for the style rule.
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      serialize_with = "serialize_selectors",
-      deserialize_with = "deserialize_selectors",
-      borrow
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(borrow))]
   pub selectors: SelectorList<'i>,
   /// A vendor prefix override, used during selector printing.
   #[cfg_attr(feature = "serde", serde(skip, default = "VendorPrefix::empty"))]
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub vendor_prefix: VendorPrefix,
   /// The declarations within the style rule.
+  #[cfg_attr(feature = "serde", serde(default))]
   pub declarations: DeclarationBlock<'i>,
   /// Nested rules within the style rule.
+  #[cfg_attr(feature = "serde", serde(default = "default_rule_list::<R>"))]
   pub rules: CssRuleList<'i, R>,
   /// The location of the rule in the source file.
-  #[skip_visit]
+  #[cfg_attr(feature = "visitor", skip_visit)]
   pub loc: Location,
+}
+
+#[cfg(feature = "serde")]
+fn default_rule_list<'i, R>() -> CssRuleList<'i, R> {
+  CssRuleList(Vec::new())
 }
 
 impl<'i, T> StyleRule<'i, T> {
@@ -83,7 +84,9 @@ impl<'i, T> StyleRule<'i, T> {
 
     Ok(false)
   }
+}
 
+impl<'i, T> StyleRule<'i, T> {
   /// Returns whether the rule is empty.
   pub fn is_empty(&self) -> bool {
     self.declarations.is_empty() && self.rules.0.is_empty()
@@ -123,6 +126,31 @@ impl<'i, T> StyleRule<'i, T> {
       })
     })
   }
+
+  /// Returns a hash of this rule for use when deduplicating.
+  /// Includes the selectors and properties.
+  #[inline]
+  pub(crate) fn hash_key(&self) -> u64 {
+    let mut hasher = ahash::AHasher::default();
+    self.selectors.hash(&mut hasher);
+    for (property, _) in self.declarations.iter() {
+      property.property_id().hash(&mut hasher);
+    }
+    hasher.finish()
+  }
+
+  /// Returns whether this rule is a duplicate of another rule.
+  /// This means it has the same selectors and properties.
+  #[inline]
+  pub(crate) fn is_duplicate(&self, other_rule: &StyleRule<'i, T>) -> bool {
+    self.declarations.len() == other_rule.declarations.len()
+      && self.selectors == other_rule.selectors
+      && self
+        .declarations
+        .iter()
+        .zip(other_rule.declarations.iter())
+        .all(|((a, _), (b, _))| a.property_id() == b.property_id())
+  }
 }
 
 fn parse_at<'i, 't, T, F>(
@@ -157,17 +185,13 @@ where
   }
 }
 
-impl<'a, 'i, T: ToCss> ToCssWithContext<'a, 'i, T> for StyleRule<'i, T> {
-  fn to_css_with_context<W>(
-    &self,
-    dest: &mut Printer<W>,
-    context: Option<&StyleContext<'a, 'i, T>>,
-  ) -> Result<(), PrinterError>
+impl<'a, 'i, T: ToCss> ToCss for StyleRule<'i, T> {
+  fn to_css<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError>
   where
     W: std::fmt::Write,
   {
     if self.vendor_prefix.is_empty() {
-      self.to_css_base(dest, context)
+      self.to_css_base(dest)
     } else {
       let mut first_rule = true;
       macro_rules! prefix {
@@ -183,7 +207,7 @@ impl<'a, 'i, T: ToCss> ToCssWithContext<'a, 'i, T> for StyleRule<'i, T> {
               dest.newline()?;
             }
             dest.vendor_prefix = VendorPrefix::$prefix;
-            self.to_css_base(dest, context)?;
+            self.to_css_base(dest)?;
           }
         };
       }
@@ -201,11 +225,7 @@ impl<'a, 'i, T: ToCss> ToCssWithContext<'a, 'i, T> for StyleRule<'i, T> {
 }
 
 impl<'a, 'i, T: ToCss> StyleRule<'i, T> {
-  fn to_css_base<W>(
-    &self,
-    dest: &mut Printer<W>,
-    context: Option<&StyleContext<'a, 'i, T>>,
-  ) -> Result<(), PrinterError>
+  fn to_css_base<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError>
   where
     W: std::fmt::Write,
   {
@@ -217,8 +237,9 @@ impl<'a, 'i, T: ToCss> StyleRule<'i, T> {
     let has_declarations = supports_nesting || len > 0 || self.rules.0.is_empty();
 
     if has_declarations {
+      #[cfg(feature = "sourcemap")]
       dest.add_mapping(self.loc);
-      self.selectors.to_css_with_context(dest, context)?;
+      self.selectors.to_css(dest)?;
       dest.whitespace()?;
       dest.write_char('{')?;
       dest.indent();
@@ -286,13 +307,7 @@ impl<'a, 'i, T: ToCss> StyleRule<'i, T> {
     } else {
       end!();
       newline!();
-      self.rules.to_css_with_context(
-        dest,
-        Some(&StyleContext {
-          rule: self,
-          parent: context,
-        }),
-      )?;
+      dest.with_context(&self.selectors, |dest| self.rules.to_css(dest))?;
     }
 
     Ok(())
